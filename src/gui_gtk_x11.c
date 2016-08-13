@@ -5747,13 +5747,13 @@ gui_gtk2_draw_string(int row, int col, char_u *s, int len, int flags)
 	    listitem_T* li = l->lv_first;
 	    guint32 bmap[4];
 	    char_u *p, *q;
-	    bmap[0] = (int) get_tv_number(&li->li_tv);
+	    bmap[0] = (int) tv_get_number(&li->li_tv);
 	    li = li->li_next;
-	    bmap[1] = (int) get_tv_number(&li->li_tv);
+	    bmap[1] = (int) tv_get_number(&li->li_tv);
 	    li = li->li_next;
-	    bmap[2] = (int) get_tv_number(&li->li_tv);
+	    bmap[2] = (int) tv_get_number(&li->li_tv);
 	    li = li->li_next;
-	    bmap[3] = (int) get_tv_number(&li->li_tv);
+	    bmap[3] = (int) tv_get_number(&li->li_tv);
 	    for (p = s, q = s + len; p < q; ++p)
 		if (*p & 0x80 || (1 & (bmap[*p >> 5] >> (*p & 31))))
 		    goto not_ascii;
