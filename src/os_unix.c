@@ -211,6 +211,15 @@ static RETSIGTYPE deathtrap SIGPROTOARG;
 static void catch_int_signal(void);
 static void set_signals(void);
 static void catch_signals(RETSIGTYPE (*func_deadly)(), RETSIGTYPE (*func_other)());
+#ifdef HAVE_SIGPROCMASK
+# define SIGSET_DECL(set)	sigset_t set;
+# define BLOCK_SIGNALS(set)	block_signals(set)
+# define UNBLOCK_SIGNALS(set)	unblock_signals(set)
+#else
+# define SIGSET_DECL(set)
+# define BLOCK_SIGNALS(set)	do { /**/ } while (0)
+# define UNBLOCK_SIGNALS(set)	do { /**/ } while (0)
+#endif
 static int  have_wildcard(int, char_u **);
 static int  have_dollars(int, char_u **);
 
@@ -228,6 +237,10 @@ static int	show_shell_mess = TRUE;
 static volatile int deadly_signal = 0;	    /* The signal we caught */
 /* volatile because it is used in signal handler deathtrap(). */
 static volatile int in_mch_delay = FALSE;    /* sleeping in mch_delay() */
+
+#if defined(FEAT_JOB_CHANNEL) && !defined(USE_SYSTEM)
+static int dont_check_job_ended = 0;
+#endif
 
 static int curr_tmode = TMODE_COOK;	/* contains current terminal mode */
 
@@ -252,7 +265,7 @@ static xsmp_config_T xsmp;
  * that describe the signals. That is nearly what we want here.  But
  * autoconf does only check for sys_siglist (without the underscore), I
  * do not want to change everything today.... jw.
- * This is why AC_DECL_SYS_SIGLIST is commented out in configure.in
+ * This is why AC_DECL_SYS_SIGLIST is commented out in configure.ac.
  */
 #endif
 
@@ -363,21 +376,6 @@ mch_write(char_u *s, int len)
 	RealWaitForChar(read_cmd_fd, p_wd, NULL, NULL);
 }
 
-#if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-/*
- * Return time in msec since "start_tv".
- */
-    static long
-elapsed(struct timeval *start_tv)
-{
-    struct timeval  now_tv;
-
-    gettimeofday(&now_tv, NULL);
-    return (now_tv.tv_sec - start_tv->tv_sec) * 1000L
-	 + (now_tv.tv_usec - start_tv->tv_usec) / 1000L;
-}
-#endif
-
 /*
  * mch_inchar(): low level input function.
  * Get a characters from the keyboard.
@@ -395,139 +393,131 @@ mch_inchar(
 {
     int		len;
     int		interrupted = FALSE;
+    int		did_start_blocking = FALSE;
     long	wait_time;
-#if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-    struct timeval  start_tv;
+    long	elapsed_time = 0;
+#ifdef ELAPSED_FUNC
+    ELAPSED_TYPE start_tv;
 
-    gettimeofday(&start_tv, NULL);
+    ELAPSED_INIT(start_tv);
 #endif
 
-#ifdef MESSAGE_QUEUE
-    parse_queued_messages();
-#endif
-
-    /* Check if window changed size while we were busy, perhaps the ":set
-     * columns=99" command was used. */
-    while (do_resize)
-	handle_resize();
-
+    /* repeat until we got a character or waited long enough */
     for (;;)
     {
-	if (wtime >= 0)
-	    wait_time = wtime;
-	else
-	    wait_time = p_ut;
-#if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-	wait_time -= elapsed(&start_tv);
-	if (wait_time >= 0)
-	{
-#endif
-	    if (WaitForChar(wait_time, &interrupted))
-		break;
-
-	    /* no character available */
-	    if (do_resize)
-	    {
-		handle_resize();
-		continue;
-	    }
-#ifdef FEAT_CLIENTSERVER
-	    if (server_waiting())
-	    {
-		parse_queued_messages();
-		continue;
-	    }
-#endif
-#ifdef MESSAGE_QUEUE
-	    if (interrupted)
-	    {
-		parse_queued_messages();
-		continue;
-	    }
-#endif
-#if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-	}
-#endif
-	if (wtime >= 0)
-	    /* no character available within "wtime" */
-	    return 0;
-
-	/* wtime == -1: no character available within 'updatetime' */
-#ifdef FEAT_AUTOCMD
-	if (trigger_cursorhold() && maxlen >= 3
-					   && !typebuf_changed(tb_change_cnt))
-	{
-	    buf[0] = K_SPECIAL;
-	    buf[1] = KS_EXTRA;
-	    buf[2] = (int)KE_CURSORHOLD;
-	    return 3;
-	}
-#endif
-	/*
-	 * If there is no character available within 'updatetime' seconds
-	 * flush all the swap files to disk.
-	 * Also done when interrupted by SIGWINCH.
-	 */
-	before_blocking();
-	break;
-    }
-
-    /* repeat until we got a character */
-    for (;;)
-    {
-	long	wtime_now = -1L;
-
-	while (do_resize)    /* window changed size */
+	/* Check if window changed size while we were busy, perhaps the ":set
+	 * columns=99" command was used. */
+	while (do_resize)
 	    handle_resize();
 
 #ifdef MESSAGE_QUEUE
 	parse_queued_messages();
-
-# ifdef FEAT_JOB_CHANNEL
-	if (has_pending_job())
-	{
-	    /* Don't wait longer than a few seconds, checking for a finished
-	     * job requires polling. */
-	    if (p_ut > 9000L)
-		wtime_now = 1000L;
-	    else
-		wtime_now = 10000L - p_ut;
-	}
-# endif
 #endif
+	if (wtime < 0 && did_start_blocking)
+	    /* blocking and already waited for p_ut */
+	    wait_time = -1;
+	else
+	{
+	    if (wtime >= 0)
+		wait_time = wtime;
+	    else
+		/* going to block after p_ut */
+		wait_time = p_ut;
+#ifdef ELAPSED_FUNC
+	    elapsed_time = ELAPSED_FUNC(start_tv);
+#endif
+	    wait_time -= elapsed_time;
+	    if (wait_time < 0)
+	    {
+		if (wtime >= 0)
+		    /* no character available within "wtime" */
+		    return 0;
+
+		if (wtime < 0)
+		{
+		    /* no character available within 'updatetime' */
+		    did_start_blocking = TRUE;
+#ifdef FEAT_AUTOCMD
+		    if (trigger_cursorhold() && maxlen >= 3
+					    && !typebuf_changed(tb_change_cnt))
+		    {
+			buf[0] = K_SPECIAL;
+			buf[1] = KS_EXTRA;
+			buf[2] = (int)KE_CURSORHOLD;
+			return 3;
+		    }
+#endif
+		    /*
+		     * If there is no character available within 'updatetime'
+		     * seconds flush all the swap files to disk.
+		     * Also done when interrupted by SIGWINCH.
+		     */
+		    before_blocking();
+		    continue;
+		}
+	    }
+	}
+
+#ifdef FEAT_JOB_CHANNEL
+	/* Checking if a job ended requires polling.  Do this every 100 msec. */
+	if (has_pending_job() && (wait_time < 0 || wait_time > 100L))
+	    wait_time = 100L;
+	/* If there is readahead then parse_queued_messages() timed out and we
+	 * should call it again soon. */
+	if ((wait_time < 0 || wait_time > 100L) && channel_any_readahead())
+	    wait_time = 10L;
+#endif
+#ifdef FEAT_BEVAL
+	if (p_beval && wait_time > 100L)
+	    /* The 'balloonexpr' may indirectly invoke a callback while waiting
+	     * for a character, need to check often. */
+	    wait_time = 100L;
+#endif
+
 	/*
 	 * We want to be interrupted by the winch signal
 	 * or by an event on the monitored file descriptors.
 	 */
-	if (!WaitForChar(wtime_now, &interrupted))
+	if (WaitForChar(wait_time, &interrupted))
 	{
-	    if (do_resize)	    /* interrupted by SIGWINCH signal */
-		continue;
-#ifdef MESSAGE_QUEUE
-	    if (interrupted || wtime_now > 0)
-	    {
-		parse_queued_messages();
-		continue;
-	    }
-#endif
-	    return 0;
+	    /* If input was put directly in typeahead buffer bail out here. */
+	    if (typebuf_changed(tb_change_cnt))
+		return 0;
+
+	    /*
+	     * For some terminals we only get one character at a time.
+	     * We want the get all available characters, so we could keep on
+	     * trying until none is available
+	     * For some other terminals this is quite slow, that's why we don't
+	     * do it.
+	     */
+	    len = read_from_input_buf(buf, (long)maxlen);
+	    if (len > 0)
+		return len;
+	    continue;
 	}
 
-	/* If input was put directly in typeahead buffer bail out here. */
-	if (typebuf_changed(tb_change_cnt))
-	    return 0;
+	/* no character available */
+#if !(defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H))
+	/* estimate the elapsed time */
+	elapsed_time += wait_time;
+#endif
 
-	/*
-	 * For some terminals we only get one character at a time.
-	 * We want the get all available characters, so we could keep on
-	 * trying until none is available
-	 * For some other terminals this is quite slow, that's why we don't do
-	 * it.
-	 */
-	len = read_from_input_buf(buf, (long)maxlen);
-	if (len > 0)
-	    return len;
+	if (do_resize	    /* interrupted by SIGWINCH signal */
+#ifdef FEAT_CLIENTSERVER
+		|| server_waiting()
+#endif
+#ifdef MESSAGE_QUEUE
+		|| interrupted
+#endif
+		|| wait_time > 0
+		|| (wtime < 0 && !did_start_blocking))
+	    continue;
+
+	/* no character available or interrupted */
+	break;
     }
+    return 0;
 }
 
     static void
@@ -1468,6 +1458,33 @@ catch_signals(
 	    signal(signal_info[i].sig, func_other);
 }
 
+#ifdef HAVE_SIGPROCMASK
+    static void
+block_signals(sigset_t *set)
+{
+    sigset_t	newset;
+    int		i;
+
+    sigemptyset(&newset);
+
+    for (i = 0; signal_info[i].sig != -1; i++)
+	sigaddset(&newset, signal_info[i].sig);
+
+# if defined(_REENTRANT) && defined(SIGCONT)
+    /* SIGCONT isn't in the list, because its default action is ignore */
+    sigaddset(&newset, SIGCONT);
+# endif
+
+    sigprocmask(SIG_BLOCK, &newset, set);
+}
+
+    static void
+unblock_signals(sigset_t *set)
+{
+    sigprocmask(SIG_SETMASK, set, NULL);
+}
+#endif
+
 /*
  * Handling of SIGHUP, SIGQUIT and SIGTERM:
  * "when" == a signal:       when busy, postpone and return FALSE, otherwise
@@ -1532,18 +1549,16 @@ mch_input_isatty(void)
 
 #ifdef FEAT_X11
 
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H) \
+# if defined(ELAPSED_TIMEVAL) \
 	&& (defined(FEAT_XCLIPBOARD) || defined(FEAT_TITLE))
-
-static void xopen_message(struct timeval *start_tv);
 
 /*
  * Give a message about the elapsed time for opening the X window.
  */
     static void
-xopen_message(struct timeval *start_tv)
+xopen_message(long elapsed_msec)
 {
-    smsg((char_u *)_("Opening the X display took %ld msec"), elapsed(start_tv));
+    smsg((char_u *)_("Opening the X display took %ld msec"), elapsed_msec);
 }
 # endif
 #endif
@@ -1842,11 +1857,11 @@ get_x11_windis(void)
 #endif
 	if (x11_display != NULL)
 	{
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
+# ifdef ELAPSED_FUNC
 	    if (p_verbose > 0)
 	    {
 		verbose_enter();
-		xopen_message(&start_tv);
+		xopen_message(ELAPSED_FUNC(start_tv));
 		verbose_leave();
 	    }
 # endif
@@ -2261,6 +2276,7 @@ use_xterm_like_mouse(char_u *name)
     return (name != NULL
 	    && (term_is_xterm
 		|| STRNICMP(name, "screen", 6) == 0
+		|| STRNICMP(name, "tmux", 4) == 0
 		|| STRICMP(name, "st") == 0
 		|| STRNICMP(name, "st-", 3) == 0
 		|| STRNICMP(name, "stterm", 6) == 0));
@@ -2324,6 +2340,7 @@ vim_is_fastterm(char_u *name)
     return (   STRNICMP(name, "hpterm", 6) == 0
 	    || STRNICMP(name, "sun-cmd", 7) == 0
 	    || STRNICMP(name, "screen", 6) == 0
+	    || STRNICMP(name, "tmux", 4) == 0
 	    || STRNICMP(name, "dtterm", 6) == 0);
 }
 
@@ -2624,7 +2641,7 @@ fname_case(
     DIR		*dirp;
     struct dirent *dp;
 
-    if (lstat((char *)name, &st) >= 0)
+    if (mch_lstat((char *)name, &st) >= 0)
     {
 	/* Open the directory where the file is located. */
 	slash = vim_strrchr(name, '/');
@@ -2657,7 +2674,7 @@ fname_case(
 		    vim_strncpy(newname, name, MAXPATHL);
 		    vim_strncpy(newname + (tail - name), (char_u *)dp->d_name,
 						    MAXPATHL - (tail - name));
-		    if (lstat((char *)newname, &st2) >= 0
+		    if (mch_lstat((char *)newname, &st2) >= 0
 			    && st.st_ino == st2.st_ino
 			    && st.st_dev == st2.st_dev)
 		    {
@@ -3020,7 +3037,7 @@ mch_isrealdir(char_u *name)
 
     if (*name == NUL)	    /* Some stat()s don't flag "" as an error. */
 	return FALSE;
-    if (lstat((char *)name, &statb))
+    if (mch_lstat((char *)name, &statb))
 	return FALSE;
 #ifdef _POSIX_SOURCE
     return (S_ISDIR(statb.st_mode) ? TRUE : FALSE);
@@ -3064,7 +3081,7 @@ executable_file(char_u *name)
 }
 
 /*
- * Return 1 if "name" can be found in $PATH and executed, 0 if not.
+ * Return TRUE if "name" can be found in $PATH and executed, FALSE if not.
  * If "use_path" is FALSE only check if "name" is executable.
  * Return -1 if unknown.
  */
@@ -3086,7 +3103,7 @@ mch_can_exe(char_u *name, char_u **path, int use_path)
 	{
 	    if (path != NULL)
 	    {
-		if (name[0] == '.')
+		if (name[0] != '/')
 		    *path = FullName_save(name, TRUE);
 		else
 		    *path = vim_strsave(name);
@@ -3125,7 +3142,7 @@ mch_can_exe(char_u *name, char_u **path, int use_path)
 	{
 	    if (path != NULL)
 	    {
-		if (buf[0] == '.')
+		if (buf[0] != '/')
 		    *path = FullName_save(buf, TRUE);
 		else
 		    *path = vim_strsave(buf);
@@ -4078,6 +4095,7 @@ mch_call_shell(
     int		tmode = cur_tmode;
 #ifdef USE_SYSTEM	/* use system() to start the shell: simple but slow */
     char_u	*newcmd;	/* only needed for unix */
+    int		x;
 
     out_flush();
 
@@ -4281,12 +4299,18 @@ mch_call_shell(
 
     if (!pipe_error)			/* pty or pipe opened or not used */
     {
+	SIGSET_DECL(curset)
+
 # ifdef __BEOS__
 	beos_cleanup_read_thread();
 # endif
 
-	if ((pid = fork()) == -1)	/* maybe we should use vfork() */
+	BLOCK_SIGNALS(&curset);
+	pid = fork();	/* maybe we should use vfork() */
+	if (pid == -1)
 	{
+	    UNBLOCK_SIGNALS(&curset);
+
 	    MSG_PUTS(_("\nCannot fork\n"));
 	    if ((options & (SHELL_READ|SHELL_WRITE))
 # ifdef FEAT_GUI
@@ -4313,6 +4337,7 @@ mch_call_shell(
 	else if (pid == 0)	/* child */
 	{
 	    reset_signals();		/* handle signals normally */
+	    UNBLOCK_SIGNALS(&curset);
 
 	    if (!show_shell_mess || (options & SHELL_EXPAND))
 	    {
@@ -4456,7 +4481,10 @@ mch_call_shell(
 	     */
 	    catch_signals(SIG_IGN, SIG_ERR);
 	    catch_int_signal();
-
+	    UNBLOCK_SIGNALS(&curset);
+# ifdef FEAT_JOB_CHANNEL
+	    ++dont_check_job_ended;
+# endif
 	    /*
 	     * For the GUI we redirect stdin, stdout and stderr to our window.
 	     * This is also used to pipe stdin/stdout to/from the external
@@ -4595,8 +4623,8 @@ mch_call_shell(
 		    ga_init2(&ga, 1, BUFLEN);
 
 		noread_cnt = 0;
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-		gettimeofday(&start_tv, NULL);
+# ifdef ELAPSED_FUNC
+		ELAPSED_INIT(start_tv);
 # endif
 		for (;;)
 		{
@@ -4631,8 +4659,8 @@ mch_call_shell(
 			  /* Get extra characters when we don't have any.
 			   * Reset the counter and timer. */
 			  noread_cnt = 0;
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-			  gettimeofday(&start_tv, NULL);
+# ifdef ELAPSED_FUNC
+			  ELAPSED_INIT(start_tv);
 # endif
 			  len = ui_inchar(ta_buf, BUFLEN, 10L, 0);
 		      }
@@ -4851,10 +4879,10 @@ mch_call_shell(
 			if (got_int)
 			    break;
 
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
+# ifdef ELAPSED_FUNC
 			if (wait_pid == 0)
 			{
-			    long	    msec = elapsed(&start_tv);
+			    long	msec = ELAPSED_FUNC(start_tv);
 
 			    /* Avoid that we keep looping here without
 			     * checking for a CTRL-C for a long time.  Don't
@@ -5001,6 +5029,10 @@ finished:
 		wait4pid(wpid, NULL);
 	    }
 
+# ifdef FEAT_JOB_CHANNEL
+	    --dont_check_job_ended;
+# endif
+
 	    /*
 	     * Set to raw mode right now, otherwise a CTRL-C after
 	     * catch_signals() will kill Vim.
@@ -5067,6 +5099,7 @@ mch_start_job(char **argv, job_T *job, jobopt_T *options UNUSED)
     int		use_file_for_out = options->jo_io[PART_OUT] == JIO_FILE;
     int		use_file_for_err = options->jo_io[PART_ERR] == JIO_FILE;
     int		use_out_for_err = options->jo_io[PART_ERR] == JIO_OUT;
+    SIGSET_DECL(curset)
 
     if (use_out_for_err && use_null_for_out)
 	use_null_for_err = TRUE;
@@ -5138,13 +5171,14 @@ mch_start_job(char **argv, job_T *job, jobopt_T *options UNUSED)
 	    goto failed;
     }
 
+    BLOCK_SIGNALS(&curset);
     pid = fork();	/* maybe we should use vfork() */
-    if (pid  == -1)
+    if (pid == -1)
     {
 	/* failed to fork */
+	UNBLOCK_SIGNALS(&curset);
 	goto failed;
     }
-
     if (pid == 0)
     {
 	int	null_fd = -1;
@@ -5152,6 +5186,7 @@ mch_start_job(char **argv, job_T *job, jobopt_T *options UNUSED)
 
 	/* child */
 	reset_signals();		/* handle signals normally */
+	UNBLOCK_SIGNALS(&curset);
 
 # ifdef HAVE_SETSID
 	/* Create our own process group, so that the child and all its
@@ -5232,6 +5267,8 @@ mch_start_job(char **argv, job_T *job, jobopt_T *options UNUSED)
     }
 
     /* parent */
+    UNBLOCK_SIGNALS(&curset);
+
     job->jv_pid = pid;
     job->jv_status = JOB_STARTED;
     job->jv_channel = channel;  /* ch_refcount was set above */
@@ -5292,8 +5329,7 @@ mch_job_status(job_T *job)
     if (wait_pid == -1)
     {
 	/* process must have exited */
-	job->jv_status = JOB_ENDED;
-	return "dead";
+	goto return_dead;
     }
     if (wait_pid == 0)
 	return "run";
@@ -5301,18 +5337,75 @@ mch_job_status(job_T *job)
     {
 	/* LINTED avoid "bitwise operation on signed value" */
 	job->jv_exitval = WEXITSTATUS(status);
-	job->jv_status = JOB_ENDED;
-	return "dead";
+	goto return_dead;
     }
     if (WIFSIGNALED(status))
     {
 	job->jv_exitval = -1;
-	job->jv_status = JOB_ENDED;
-	return "dead";
+	goto return_dead;
     }
     return "run";
+
+return_dead:
+    if (job->jv_status < JOB_ENDED)
+    {
+	ch_log(job->jv_channel, "Job ended");
+	job->jv_status = JOB_ENDED;
+    }
+    return "dead";
 }
 
+    job_T *
+mch_detect_ended_job(job_T *job_list)
+{
+# ifdef HAVE_UNION_WAIT
+    union wait	status;
+# else
+    int		status = -1;
+# endif
+    pid_t	wait_pid = 0;
+    job_T	*job;
+
+# ifndef USE_SYSTEM
+    /* Do not do this when waiting for a shell command to finish, we would get
+     * the exit value here (and discard it), the exit value obtained there
+     * would then be wrong.  */
+    if (dont_check_job_ended > 0)
+	return NULL;
+# endif
+
+# ifdef __NeXT__
+    wait_pid = wait4(-1, &status, WNOHANG, (struct rusage *)0);
+# else
+    wait_pid = waitpid(-1, &status, WNOHANG);
+# endif
+    if (wait_pid <= 0)
+	/* no process ended */
+	return NULL;
+    for (job = job_list; job != NULL; job = job->jv_next)
+    {
+	if (job->jv_pid == wait_pid)
+	{
+	    if (WIFEXITED(status))
+		/* LINTED avoid "bitwise operation on signed value" */
+		job->jv_exitval = WEXITSTATUS(status);
+	    else if (WIFSIGNALED(status))
+		job->jv_exitval = -1;
+	    if (job->jv_status < JOB_ENDED)
+	    {
+		ch_log(job->jv_channel, "Job ended");
+		job->jv_status = JOB_ENDED;
+	    }
+	    return job;
+	}
+    }
+    return NULL;
+}
+
+/*
+ * Send a (deadly) signal to "job".
+ * Return FAIL if "how" is not a valid name.
+ */
     int
 mch_stop_job(job_T *job, char_u *how)
 {
@@ -5336,8 +5429,10 @@ mch_stop_job(job_T *job, char_u *how)
 
     /* TODO: have an option to only kill the process, not the group? */
     job_pid = job->jv_pid;
+#ifdef HAVE_GETPGID
     if (job_pid == getpgid(job_pid))
 	job_pid = -job_pid;
+#endif
 
     kill(job_pid, sig);
 
@@ -5364,9 +5459,10 @@ mch_clear_job(job_T *job)
  * In cooked mode we should get SIGINT, no need to check.
  */
     void
-mch_breakcheck(void)
+mch_breakcheck(int force)
 {
-    if (curr_tmode == TMODE_RAW && RealWaitForChar(read_cmd_fd, 0L, NULL, NULL))
+    if ((curr_tmode == TMODE_RAW || force)
+			       && RealWaitForChar(read_cmd_fd, 0L, NULL, NULL))
 	fill_input_buf(FALSE);
 }
 
@@ -5531,15 +5627,14 @@ RealWaitForChar(int fd, long msec, int *check_for_gpm UNUSED, int *interrupted)
     /* May retry getting characters after an event was handled. */
 # define MAY_LOOP
 
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
+# ifdef ELAPSED_FUNC
     /* Remember at what time we started, so that we know how much longer we
      * should wait after being interrupted. */
-#  define USE_START_TV
     long	    start_msec = msec;
-    struct timeval  start_tv;
+    ELAPSED_TYPE  start_tv;
 
     if (msec > 0)
-	gettimeofday(&start_tv, NULL);
+	ELAPSED_INIT(start_tv);
 # endif
 
     /* Handle being called recursively.  This may happen for the session
@@ -5846,9 +5941,9 @@ select_eintr:
 	/* We're going to loop around again, find out for how long */
 	if (msec > 0)
 	{
-# ifdef USE_START_TV
+# ifdef ELAPSED_FUNC
 	    /* Compute remaining wait time. */
-	    msec = start_msec - elapsed(&start_tv);
+	    msec = start_msec - ELAPSED_FUNC(start_tv);
 # else
 	    /* Guess we got interrupted halfway. */
 	    msec = msec / 2;
@@ -5911,6 +6006,7 @@ mch_expand_wildcards(
 {
     int		i;
     size_t	len;
+    long	llen;
     char_u	*p;
     int		dir;
 
@@ -6044,7 +6140,7 @@ mch_expand_wildcards(
 	STRCAT(command, pat[0] + 1);		/* exclude first backtick */
 	p = command + STRLEN(command) - 1;
 	*p-- = ')';				/* remove last backtick */
-	while (p > command && vim_iswhite(*p))
+	while (p > command && VIM_ISWHITE(*p))
 	    --p;
 	if (*p == '&')				/* remove trailing '&' */
 	{
@@ -6197,9 +6293,13 @@ mch_expand_wildcards(
 	goto notfound;
     }
     fseek(fd, 0L, SEEK_END);
-    len = ftell(fd);			/* get size of temp file */
+    llen = ftell(fd);			/* get size of temp file */
     fseek(fd, 0L, SEEK_SET);
-    buffer = alloc(len + 1);
+    if (llen < 0)
+	/* just in case ftell() would fail */
+	buffer = NULL;
+    else
+	buffer = alloc(llen + 1);
     if (buffer == NULL)
     {
 	/* out of memory */
@@ -6208,6 +6308,7 @@ mch_expand_wildcards(
 	fclose(fd);
 	return FAIL;
     }
+    len = llen;
     i = fread((char *)buffer, 1, len, fd);
     fclose(fd);
     mch_remove(tempname);
@@ -6427,7 +6528,7 @@ save_patterns(
     int
 mch_has_exp_wildcard(char_u *p)
 {
-    for ( ; *p; mb_ptr_adv(p))
+    for ( ; *p; MB_PTR_ADV(p))
     {
 	if (*p == '\\' && p[1] != NUL)
 	    ++p;
@@ -6451,7 +6552,7 @@ mch_has_exp_wildcard(char_u *p)
     int
 mch_has_wildcard(char_u *p)
 {
-    for ( ; *p; mb_ptr_adv(p))
+    for ( ; *p; MB_PTR_ADV(p))
     {
 	if (*p == '\\' && p[1] != NUL)
 	    ++p;
@@ -6831,7 +6932,7 @@ mch_libcall(
 	    if (argstring != NULL)
 	    {
 # if defined(USE_DLOPEN)
-		ProcAdd = (STRPROCSTR)dlsym(hinstLib, (const char *)funcname);
+		*(void **)(&ProcAdd) = dlsym(hinstLib, (const char *)funcname);
 		dlerr = (char *)dlerror();
 # else
 		if (shl_findsym(&hinstLib, (const char *)funcname,
@@ -6853,7 +6954,7 @@ mch_libcall(
 	    else
 	    {
 # if defined(USE_DLOPEN)
-		ProcAddI = (INTPROCSTR)dlsym(hinstLib, (const char *)funcname);
+		*(void **)(&ProcAddI) = dlsym(hinstLib, (const char *)funcname);
 		dlerr = (char *)dlerror();
 # else
 		if (shl_findsym(&hinstLib, (const char *)funcname,
@@ -6945,11 +7046,11 @@ setup_term_clip(void)
 #if defined(HAVE_SETJMP_H)
 	int (*oldIOhandler)();
 #endif
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-	struct timeval  start_tv;
+# ifdef ELAPSED_FUNC
+	ELAPSED_TYPE  start_tv;
 
 	if (p_verbose > 0)
-	    gettimeofday(&start_tv, NULL);
+	    ELAPSED_INIT(start_tv);
 # endif
 
 	/* Ignore X errors while opening the display */
@@ -6991,11 +7092,11 @@ setup_term_clip(void)
 	/* Catch terminating error of the X server connection. */
 	(void)XSetIOErrorHandler(x_IOerror_handler);
 
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
+# ifdef ELAPSED_FUNC
 	if (p_verbose > 0)
 	{
 	    verbose_enter();
-	    xopen_message(&start_tv);
+	    xopen_message(ELAPSED_FUNC(start_tv));
 	    verbose_leave();
 	}
 # endif

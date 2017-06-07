@@ -61,6 +61,38 @@ func Test_after_comes_later()
   call delete('Xafter', 'rf')
 endfunc
 
+func Test_pack_in_rtp_when_plugins_run()
+  if !has('packages')
+    return
+  endif
+  let before = [
+	\ 'set nocp viminfo+=nviminfo',
+	\ 'set guioptions+=M',
+	\ 'let $HOME = "/does/not/exist"',
+	\ 'set loadplugins',
+	\ 'set rtp=Xhere',
+	\ 'set packpath=Xhere',
+	\ 'set nomore',
+	\ ]
+  let after = [
+	\ 'quit',
+	\ ]
+  call mkdir('Xhere/plugin', 'p')
+  call writefile(['redir! > Xtestout', 'silent set runtimepath?', 'silent! call foo#Trigger()', 'redir END'], 'Xhere/plugin/here.vim')
+  call mkdir('Xhere/pack/foo/start/foobar/autoload', 'p')
+  call writefile(['function! foo#Trigger()', 'echo "autoloaded foo"', 'endfunction'], 'Xhere/pack/foo/start/foobar/autoload/foo.vim')
+
+  if RunVim(before, after, '')
+
+    let lines = filter(readfile('Xtestout'), '!empty(v:val)')
+    call assert_match('Xhere[/\\]pack[/\\]foo[/\\]start[/\\]foobar', get(lines, 0))
+    call assert_match('autoloaded foo', get(lines, 1))
+  endif
+
+  call delete('Xtestout')
+  call delete('Xhere', 'rf')
+endfunc
+
 func Test_help_arg()
   if !has('unix') && has('gui')
     " this doesn't work with gvim on MS-Windows
@@ -182,4 +214,42 @@ func Test_read_stdin()
     call assert_equal(['something'], split(lines[0]))
   endif
   call delete('Xtestout')
+endfunc
+
+func Test_progpath()
+  " Tests normally run with "./vim" or "../vim", these must have been expanded
+  " to a full path.
+  if has('unix')
+    call assert_equal('/', v:progpath[0])
+  elseif has('win32')
+    call assert_equal(':', v:progpath[1])
+    call assert_match('[/\\]', v:progpath[2])
+  endif
+
+  " Only expect "vim" to appear in v:progname.
+  call assert_match('vim\c', v:progname)
+endfunc
+
+func Test_silent_ex_mode()
+  if !has('unix') || has('gui_running')
+    " can't get output of Vim.
+    return
+  endif
+
+  " This caused an ml_get error.
+  let out = system(GetVimCommand() . '-u NONE -es -c''set verbose=1|h|exe "%norm\<c-y>\<c-d>"'' -c cq')
+  call assert_notmatch('E315:', out)
+endfunc
+
+func Test_default_term()
+  if !has('unix') || has('gui_running')
+    " can't get output of Vim.
+    return
+  endif
+
+  let save_term = $TERM
+  let $TERM = 'unknownxxx'
+  let out = system(GetVimCommand() . ' -c''set term'' -c cq')
+  call assert_match("defaulting to 'ansi'", out)
+  let $TERM = save_term
 endfunc

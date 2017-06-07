@@ -256,7 +256,7 @@ linelen(int *has_tab)
 
     /* find the character after the last non-blank character */
     for (last = first + STRLEN(first);
-				last > first && vim_iswhite(last[-1]); --last)
+				last > first && VIM_ISWHITE(last[-1]); --last)
 	;
     save = *last;
     *last = NUL;
@@ -400,7 +400,7 @@ ex_sort(exarg_T *eap)
 
     for (p = eap->arg; *p != NUL; ++p)
     {
-	if (vim_iswhite(*p))
+	if (VIM_ISWHITE(*p))
 	    ;
 	else if (*p == 'i')
 	    sort_ic = TRUE;
@@ -683,7 +683,7 @@ ex_retab(exarg_T *eap)
 	did_undo = FALSE;
 	for (;;)
 	{
-	    if (vim_iswhite(ptr[col]))
+	    if (VIM_ISWHITE(ptr[col]))
 	    {
 		if (!got_tab && num_spaces == 0)
 		{
@@ -799,14 +799,8 @@ do_move(linenr_T line1, linenr_T line2, linenr_T dest)
     linenr_T	num_lines;  /* Num lines moved */
     linenr_T	last_line;  /* Last line in file after adding new text */
 #ifdef FEAT_FOLDING
-    int		isFolded;
-
-    /* Moving lines seems to corrupt the folds, delete folding info now
-     * and recreate it when finished.  Don't do this for manual folding, it
-     * would delete all folds. */
-    isFolded = hasAnyFolding(curwin) && !foldmethodIsManual(curwin);
-    if (isFolded)
-	deleteFoldRecurse(&curwin->w_folds);
+    win_T	*win;
+    tabpage_T	*tp;
 #endif
 
     if (dest >= line1 && dest < line2)
@@ -851,24 +845,34 @@ do_move(linenr_T line1, linenr_T line2, linenr_T dest)
      * their final destination at the new text position -- webb
      */
     last_line = curbuf->b_ml.ml_line_count;
-    mark_adjust(line1, line2, last_line - line2, 0L);
-    changed_lines(last_line - num_lines + 1, 0, last_line + 1, num_lines);
+    mark_adjust_nofold(line1, line2, last_line - line2, 0L);
     if (dest >= line2)
     {
-	mark_adjust(line2 + 1, dest, -num_lines, 0L);
+	mark_adjust_nofold(line2 + 1, dest, -num_lines, 0L);
+#ifdef FEAT_FOLDING
+	FOR_ALL_TAB_WINDOWS(tp, win) {
+	    if (win->w_buffer == curbuf)
+		foldMoveRange(&win->w_folds, line1, line2, dest);
+	}
+#endif
 	curbuf->b_op_start.lnum = dest - num_lines + 1;
 	curbuf->b_op_end.lnum = dest;
     }
     else
     {
-	mark_adjust(dest + 1, line1 - 1, num_lines, 0L);
+	mark_adjust_nofold(dest + 1, line1 - 1, num_lines, 0L);
+#ifdef FEAT_FOLDING
+	FOR_ALL_TAB_WINDOWS(tp, win) {
+	    if (win->w_buffer == curbuf)
+		foldMoveRange(&win->w_folds, dest + 1, line1 - 1, line2);
+	}
+#endif
 	curbuf->b_op_start.lnum = dest + 1;
 	curbuf->b_op_end.lnum = dest + num_lines;
     }
     curbuf->b_op_start.col = curbuf->b_op_end.col = 0;
-    mark_adjust(last_line - num_lines + 1, last_line,
+    mark_adjust_nofold(last_line - num_lines + 1, last_line,
 					     -(last_line - dest - extra), 0L);
-    changed_lines(last_line - num_lines + 1, 0, last_line + 1, -extra);
 
     /*
      * Now we delete the original text -- webb
@@ -905,12 +909,6 @@ do_move(linenr_T line1, linenr_T line2, linenr_T dest)
     }
     else
 	changed_lines(dest + 1, 0, line1 + num_lines, 0L);
-
-#ifdef FEAT_FOLDING
-	/* recreate folds */
-	if (isFolded)
-	    foldUpdateAll(curwin);
-#endif
 
     return OK;
 }
@@ -1175,14 +1173,6 @@ do_filter(
     if (*cmd == NUL)	    /* no filter command */
 	return;
 
-#ifdef WIN3264
-    /*
-     * Check if external commands are allowed now.
-     */
-    if (can_end_termcap_mode(TRUE) == FALSE)
-	return;
-#endif
-
     cursor_save = curwin->w_cursor;
     linecount = line2 - line1 + 1;
     curwin->w_cursor.lnum = line1;
@@ -1321,7 +1311,7 @@ do_filter(
 	if (otmp != NULL)
 	{
 	    if (readfile(otmp, NULL, line2, (linenr_T)0, (linenr_T)MAXLNUM,
-						    eap, READ_FILTER) == FAIL)
+						    eap, READ_FILTER) != OK)
 	    {
 #if defined(FEAT_AUTOCMD) && defined(FEAT_EVAL)
 		if (!aborting())
@@ -1459,12 +1449,6 @@ do_shell(
     }
 
 #ifdef MSWIN
-    /*
-     * Check if external commands are allowed now.
-     */
-    if (can_end_termcap_mode(TRUE) == FALSE)
-	return;
-
     /*
      * Check if ":!start" is used.
      */
@@ -2905,7 +2889,7 @@ print_line_no_prefix(
     {
 	vim_snprintf((char *)numbuf, sizeof(numbuf),
 				   "%*ld ", number_width(curwin), (long)lnum);
-	msg_puts_attr(numbuf, hl_attr(HLF_N));	/* Highlight line nrs */
+	msg_puts_attr(numbuf, HL_ATTR(HLF_N));	/* Highlight line nrs */
     }
     msg_prt_line(ml_get(lnum), list);
 }
@@ -3536,11 +3520,14 @@ check_readonly(int *forceit, buf_T *buf)
 
 /*
  * Try to abandon current file and edit a new or existing file.
- * 'fnum' is the number of the file, if zero use ffname/sfname.
+ * "fnum" is the number of the file, if zero use ffname/sfname.
+ * "lnum" is the line number for the cursor in the new file (if non-zero).
  *
- * Return 1 for "normal" error, 2 for "not written" error, 0 for success
- * -1 for successfully opening another file.
- * 'lnum' is the line number for the cursor in the new file (if non-zero).
+ * Return:
+ * GETFILE_ERROR for "normal" error,
+ * GETFILE_NOT_WRITTEN for "not written" error,
+ * GETFILE_SAME_FILE for success
+ * GETFILE_OPEN_OTHER for successfully opening another file.
  */
     int
 getfile(
@@ -3556,10 +3543,10 @@ getfile(
     char_u	*free_me = NULL;
 
     if (text_locked())
-	return 1;
+	return GETFILE_ERROR;
 #ifdef FEAT_AUTOCMD
     if (curbuf_locked())
-	return 1;
+	return GETFILE_ERROR;
 #endif
 
     if (fnum == 0)
@@ -3586,7 +3573,7 @@ getfile(
 	    if (other)
 		--no_wait_return;
 	    EMSG(_(e_nowrtmsg));
-	    retval = 2;	/* file has been changed */
+	    retval = GETFILE_NOT_WRITTEN;	/* file has been changed */
 	    goto theend;
 	}
     }
@@ -3600,14 +3587,14 @@ getfile(
 	    curwin->w_cursor.lnum = lnum;
 	check_cursor_lnum();
 	beginline(BL_SOL | BL_FIX);
-	retval = 0;	/* it's in the same file */
+	retval = GETFILE_SAME_FILE;	/* it's in the same file */
     }
     else if (do_ecmd(fnum, ffname, sfname, NULL, lnum,
 		(P_HID(curbuf) ? ECMD_HIDE : 0) + (forceit ? ECMD_FORCEIT : 0),
 		curwin) == OK)
-	retval = -1;	/* opened another file */
+	retval = GETFILE_OPEN_OTHER;	/* opened another file */
     else
-	retval = 1;	/* error encountered */
+	retval = GETFILE_ERROR;		/* error encountered */
 
 theend:
     vim_free(free_me);
@@ -3981,7 +3968,8 @@ do_ecmd(
 		     * <VN> We could instead free the synblock
 		     * and re-attach to buffer, perhaps.
 		     */
-		    if (curwin->w_s == &(curwin->w_buffer->b_s))
+		    if (curwin->w_buffer != NULL
+			    && curwin->w_s == &(curwin->w_buffer->b_s))
 			curwin->w_s = &(buf->b_s);
 #endif
 		    curwin->w_buffer = buf;
@@ -4224,7 +4212,7 @@ do_ecmd(
 
 	/* If autocommands change the cursor position or topline, we should
 	 * keep it.  Also when it moves within a line. */
-	if (!equalpos(curwin->w_cursor, orig_pos))
+	if (!EQUAL_POS(curwin->w_cursor, orig_pos))
 	{
 	    newlnum = curwin->w_cursor.lnum;
 	    newcol = curwin->w_cursor.col;
@@ -4579,7 +4567,7 @@ ex_change(exarg_T *eap)
 ex_z(exarg_T *eap)
 {
     char_u	*x;
-    int		bigness;
+    long	bigness;
     char_u	*kind;
     int		minus = 0;
     linenr_T	start, end, curs, i;
@@ -4591,7 +4579,7 @@ ex_z(exarg_T *eap)
     if (eap->forceit)
 	bigness = curwin->w_height;
 #ifdef FEAT_WINDOWS
-    else if (firstwin != lastwin)
+    else if (!ONE_WINDOW)
 	bigness = curwin->w_height - 3;
 #endif
     else
@@ -4616,7 +4604,12 @@ ex_z(exarg_T *eap)
 	}
 	else
 	{
-	    bigness = atoi((char *)x);
+	    bigness = atol((char *)x);
+
+	    /* bigness could be < 0 if atol(x) overflows. */
+	    if (bigness > 2 * curbuf->b_ml.ml_line_count || bigness < 0)
+		bigness = 2 * curbuf->b_ml.ml_line_count;
+
 	    p_window = bigness;
 	    if (*kind == '=')
 		bigness += 2;
@@ -4674,6 +4667,8 @@ ex_z(exarg_T *eap)
 
     if (curs > curbuf->b_ml.ml_line_count)
 	curs = curbuf->b_ml.ml_line_count;
+    else if (curs < 1)
+	curs = 1;
 
     for (i = start; i <= end; i++)
     {
@@ -4696,7 +4691,11 @@ ex_z(exarg_T *eap)
 	}
     }
 
-    curwin->w_cursor.lnum = curs;
+    if (curwin->w_cursor.lnum != curs)
+    {
+	curwin->w_cursor.lnum = curs;
+	curwin->w_cursor.col = 0;
+    }
     ex_no_reprint = TRUE;
 }
 
@@ -4820,7 +4819,7 @@ do_sub(exarg_T *eap)
 	which_pat = RE_SUBST;	/* use last substitute regexp */
 
 				/* new pattern and substitution */
-    if (eap->cmd[0] == 's' && *cmd != NUL && !vim_iswhite(*cmd)
+    if (eap->cmd[0] == 's' && *cmd != NUL && !VIM_ISWHITE(*cmd)
 		&& vim_strchr((char_u *)"0123456789cegriIp|\"", *cmd) == NULL)
     {
 				/* don't accept alphanumeric for separator */
@@ -4876,7 +4875,7 @@ do_sub(exarg_T *eap)
 	    }
 	    if (cmd[0] == '\\' && cmd[1] != 0)	/* skip escaped characters */
 		++cmd;
-	    mb_ptr_adv(cmd);
+	    MB_PTR_ADV(cmd);
 	}
 
 	if (!eap->skip)
@@ -5276,6 +5275,10 @@ do_sub(exarg_T *eap)
 		    setmouse();		/* disable mouse in xterm */
 #endif
 		    curwin->w_cursor.col = regmatch.startpos[0].col;
+#ifdef FEAT_CURSORBIND
+		    if (curwin->w_p_crb)
+			do_check_cursorbind();
+#endif
 
 		    /* When 'cpoptions' contains "u" don't sync undo when
 		     * asking for confirmation. */
@@ -5297,6 +5300,8 @@ do_sub(exarg_T *eap)
 
 			    getvcol(curwin, &curwin->w_cursor, &sc, NULL, NULL);
 			    curwin->w_cursor.col = regmatch.endpos[0].col - 1;
+			    if (curwin->w_cursor.col < 0)
+				curwin->w_cursor.col = 0;
 			    getvcol(curwin, &curwin->w_cursor, NULL, NULL, &ec);
 			    if (subflags.do_number || curwin->w_p_nu)
 			    {
@@ -5388,7 +5393,7 @@ do_sub(exarg_T *eap)
 			    msg_no_more = TRUE;
 			    /* write message same highlighting as for
 			     * wait_return */
-			    smsg_attr(hl_attr(HLF_R),
+			    smsg_attr(HL_ATTR(HLF_R),
 				    (char_u *)_("replace with %s (y/n/a/q/l/^E/^Y)?"), sub);
 			    msg_no_more = FALSE;
 			    msg_scroll = i;
@@ -6232,7 +6237,7 @@ ex_help(exarg_T *eap)
 
     /* remove trailing blanks */
     p = arg + STRLEN(arg) - 1;
-    while (p > arg && vim_iswhite(*p) && p[-1] != '\\')
+    while (p > arg && VIM_ISWHITE(*p) && p[-1] != '\\')
 	*p-- = NUL;
 
 #ifdef FEAT_MULTI_LANG
@@ -6512,18 +6517,20 @@ find_help_tags(
     static char *(mtable[]) = {"*", "g*", "[*", "]*", ":*",
 			       "/*", "/\\*", "\"*", "**",
 			       "cpo-*", "/\\(\\)", "/\\%(\\)",
-			       "?", ":?", "?<CR>", "g?", "g?g?", "g??", "z?",
+			       "?", ":?", "?<CR>", "g?", "g?g?", "g??",
 			       "/\\?", "/\\z(\\)", "\\=", ":s\\=",
-			       "[count]", "[quotex]", "[range]",
+			       "[count]", "[quotex]",
+			       "[range]", ":[range]",
 			       "[pattern]", "\\|", "\\%$",
 			       "s/\\~", "s/\\U", "s/\\L",
 			       "s/\\1", "s/\\2", "s/\\3", "s/\\9"};
     static char *(rtable[]) = {"star", "gstar", "[star", "]star", ":star",
 			       "/star", "/\\\\star", "quotestar", "starstar",
 			       "cpo-star", "/\\\\(\\\\)", "/\\\\%(\\\\)",
-			       "?", ":?", "?<CR>", "g?", "g?g?", "g??", "z?",
+			       "?", ":?", "?<CR>", "g?", "g?g?", "g??",
 			       "/\\\\?", "/\\\\z(\\\\)", "\\\\=", ":s\\\\=",
-			       "\\[count]", "\\[quotex]", "\\[range]",
+			       "\\[count]", "\\[quotex]",
+			       "\\[range]", ":\\[range]",
 			       "\\[pattern]", "\\\\bar", "/\\\\%\\$",
 			       "s/\\\\\\~", "s/\\\\U", "s/\\\\L",
 			       "s/\\\\1", "s/\\\\2", "s/\\\\3", "s/\\\\9"};
@@ -6814,7 +6821,7 @@ fix_help_buffer(void)
 	{
 	    line = ml_get_buf(curbuf, lnum, FALSE);
 	    len = (int)STRLEN(line);
-	    if (in_example && len > 0 && !vim_iswhite(line[0]))
+	    if (in_example && len > 0 && !VIM_ISWHITE(line[0]))
 	    {
 		/* End of example: non-white or '<' in first column. */
 		if (line[0] == '<')
@@ -6922,7 +6929,7 @@ fix_help_buffer(void)
 				    continue;
 				e1 = vim_strrchr(t1, '.');
 				e2 = vim_strrchr(gettail(f2), '.');
-				if (e1 == NUL || e2 == NUL)
+				if (e1 == NULL || e2 == NULL)
 				    continue;
 				if (fnamecmp(e1, ".txt") != 0
 				    && fnamecmp(e1, fname + 4) != 0)
@@ -7426,7 +7433,7 @@ ex_helptags(exarg_T *eap)
     int		add_help_tags = FALSE;
 
     /* Check for ":helptags ++t {dir}". */
-    if (STRNCMP(eap->arg, "++t", 3) == 0 && vim_iswhite(eap->arg[3]))
+    if (STRNCMP(eap->arg, "++t", 3) == 0 && VIM_ISWHITE(eap->arg[3]))
     {
 	add_help_tags = TRUE;
 	eap->arg = skipwhite(eap->arg + 3);
@@ -7759,7 +7766,7 @@ ex_sign(exarg_T *eap)
 	if (VIM_ISDIGIT(*arg))
 	{
 	    id = getdigits(&arg);
-	    if (!vim_iswhite(*arg) && *arg != NUL)
+	    if (!VIM_ISWHITE(*arg) && *arg != NUL)
 	    {
 		id = -1;
 		arg = arg1;
@@ -7969,7 +7976,7 @@ sign_list_defined(sign_T *sp)
     if (sp->sn_line_hl > 0)
     {
 	MSG_PUTS(" linehl=");
-	p = get_highlight_name(NULL, sp->sn_line_hl - 1);
+	p = get_highlight_name_ext(NULL, sp->sn_line_hl - 1, FALSE);
 	if (p == NULL)
 	    MSG_PUTS("NONE");
 	else
@@ -7978,7 +7985,7 @@ sign_list_defined(sign_T *sp)
     if (sp->sn_text_hl > 0)
     {
 	MSG_PUTS(" texthl=");
-	p = get_highlight_name(NULL, sp->sn_text_hl - 1);
+	p = get_highlight_name_ext(NULL, sp->sn_text_hl - 1, FALSE);
 	if (p == NULL)
 	    MSG_PUTS("NONE");
 	else
@@ -8219,7 +8226,7 @@ set_context_in_sign_cmd(expand_T *xp, char_u *arg)
     /* :sign define {name} {args}... {last}=
      *				     |	   |
      *				  last	   p */
-    if (p == NUL)
+    if (p == NULL)
     {
 	/* Expand last argument name (before equal sign). */
 	xp->xp_pattern = last;
@@ -8291,7 +8298,7 @@ ex_smile(exarg_T *eap UNUSED)
 	    else
 		for (n = *p++; n > 0; --n)
 		    if (*p == 'o' || *p == '$')
-			msg_putchar_attr(*p, hl_attr(HLF_L));
+			msg_putchar_attr(*p, HL_ATTR(HLF_L));
 		    else
 			msg_putchar(*p);
     msg_clr_eos();

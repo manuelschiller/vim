@@ -102,12 +102,8 @@ extern void bonobo_dock_item_set_behavior(BonoboDockItem *dock_item, BonoboDockI
 /*
  * Easy-to-use macro for multihead support.
  */
-#ifdef HAVE_GTK_MULTIHEAD
-# define GET_X_ATOM(atom)	gdk_x11_atom_to_xatom_for_display( \
+#define GET_X_ATOM(atom)	gdk_x11_atom_to_xatom_for_display( \
 				    gtk_widget_get_display(gui.mainwin), atom)
-#else
-# define GET_X_ATOM(atom)	((Atom)(atom))
-#endif
 
 /* Selection type distinguishers */
 enum
@@ -627,6 +623,7 @@ static void gui_gtk_window_clear(GdkWindow *win);
     static void
 gui_gtk3_redraw(int x, int y, int width, int height)
 {
+    /* Range checks are left to gui_redraw_block() */
     gui_redraw_block(Y_2_ROW(y), X_2_COL(x),
 	    Y_2_ROW(y + height - 1), X_2_COL(x + width - 1),
 	    GUI_MON_NOCLEAR);
@@ -681,12 +678,20 @@ draw_event(GtkWidget *widget UNUSED,
 	if (list->status != CAIRO_STATUS_CLIP_NOT_REPRESENTABLE)
 	{
 	    int i;
+
+	    /* First clear all the blocks and then redraw them.  Just in case
+	     * some blocks overlap. */
 	    for (i = 0; i < list->num_rectangles; i++)
 	    {
 		const cairo_rectangle_t rect = list->rectangles[i];
 
-		gui_mch_clear_block(Y_2_ROW(rect.y), 1,
-			Y_2_ROW(rect.y + rect.height - 1), Columns);
+		gui_mch_clear_block(Y_2_ROW((int)rect.y), 0,
+			Y_2_ROW((int)(rect.y + rect.height)) - 1, Columns - 1);
+	    }
+
+	    for (i = 0; i < list->num_rectangles; i++)
+	    {
+		const cairo_rectangle_t rect = list->rectangles[i];
 
 		if (blink_mode)
 		    gui_gtk3_redraw(rect.x, rect.y, rect.width, rect.height);
@@ -2837,7 +2842,7 @@ mainwin_realize(GtkWidget *widget UNUSED, gpointer data UNUSED)
 	/*
 	 * Cannot handle "XLib-only" windows with gtk event routines, we'll
 	 * have to change the "server" registration to that of the main window
-	 * If we have not registered a name yet, remember the window
+	 * If we have not registered a name yet, remember the window.
 	 */
 # if GTK_CHECK_VERSION(3,0,0)
 	serverChangeRegisteredWindow(GDK_WINDOW_XDISPLAY(mainwin_win),
@@ -2875,16 +2880,14 @@ create_blank_pointer(void)
     char	blank_data[] = { 0x0 };
 #endif
 
-#ifdef HAVE_GTK_MULTIHEAD
-# if GTK_CHECK_VERSION(3,12,0)
+#if GTK_CHECK_VERSION(3,12,0)
     {
 	GdkWindow * const win = gtk_widget_get_window(gui.mainwin);
 	GdkScreen * const scrn = gdk_window_get_screen(win);
 	root_window = gdk_screen_get_root_window(scrn);
     }
-# else
+#else
     root_window = gtk_widget_get_root_window(gui.mainwin);
-# endif
 #endif
 
     /* Create a pseudo blank pointer, which is in fact one pixel by one pixel
@@ -2923,7 +2926,6 @@ create_blank_pointer(void)
     return cursor;
 }
 
-#ifdef HAVE_GTK_MULTIHEAD
     static void
 mainwin_screen_changed_cb(GtkWidget  *widget,
 			  GdkScreen  *previous_screen UNUSED,
@@ -2936,22 +2938,22 @@ mainwin_screen_changed_cb(GtkWidget  *widget,
      * Recreate the invisible mouse cursor.
      */
     if (gui.blank_pointer != NULL)
-# if GTK_CHECK_VERSION(3,0,0)
+#if GTK_CHECK_VERSION(3,0,0)
 	g_object_unref(G_OBJECT(gui.blank_pointer));
-# else
+#else
 	gdk_cursor_unref(gui.blank_pointer);
-# endif
+#endif
 
     gui.blank_pointer = create_blank_pointer();
 
-# if GTK_CHECK_VERSION(3,0,0)
+#if GTK_CHECK_VERSION(3,0,0)
     if (gui.pointer_hidden && gtk_widget_get_window(gui.drawarea) != NULL)
 	gdk_window_set_cursor(gtk_widget_get_window(gui.drawarea),
 		gui.blank_pointer);
-# else
+#else
     if (gui.pointer_hidden && gui.drawarea->window != NULL)
 	gdk_window_set_cursor(gui.drawarea->window, gui.blank_pointer);
-# endif
+#endif
 
     /*
      * Create a new PangoContext for this screen, and initialize it
@@ -2969,7 +2971,6 @@ mainwin_screen_changed_cb(GtkWidget  *widget,
 	gui_set_shellsize(FALSE, FALSE, RESIZE_BOTH);
     }
 }
-#endif /* HAVE_GTK_MULTIHEAD */
 
 /*
  * After the drawing area comes up, we calculate all colors and create the
@@ -3076,10 +3077,16 @@ drawarea_unrealize_cb(GtkWidget *widget UNUSED, gpointer data UNUSED)
     gui.blank_pointer = NULL;
 }
 
+#if GTK_CHECK_VERSION(3,22,2)
+    static void
+drawarea_style_updated_cb(GtkWidget *widget UNUSED,
+			 gpointer data UNUSED)
+#else
     static void
 drawarea_style_set_cb(GtkWidget	*widget UNUSED,
 		      GtkStyle	*previous_style UNUSED,
 		      gpointer	data UNUSED)
+#endif
 {
     gui_mch_new_colors();
 }
@@ -3095,6 +3102,35 @@ drawarea_configure_event_cb(GtkWidget	      *widget,
 
     g_return_val_if_fail(event
 	    && event->width >= 1 && event->height >= 1, TRUE);
+
+# if GTK_CHECK_VERSION(3,22,2) && !GTK_CHECK_VERSION(3,22,4)
+    /* As of 3.22.2, GdkWindows have started distributing configure events to
+     * their "native" children (https://git.gnome.org/browse/gtk+/commit/?h=gtk-3-22&id=12579fe71b3b8f79eb9c1b80e429443bcc437dd0).
+     *
+     * As can be seen from the implementation of move_native_children() and
+     * configure_native_child() in gdkwindow.c, those functions actually
+     * propagate configure events to every child, failing to distinguish
+     * "native" one from non-native one.
+     *
+     * Naturally, configure events propagated to here like that are fallacious
+     * and, as a matter of fact, they trigger a geometric collapse of
+     * gui.drawarea in fullscreen and miximized modes.
+     *
+     * To filter out such nuisance events, we are making use of the fact that
+     * the field send_event of such GdkEventConfigures is set to FALSE in
+     * configure_native_child().
+     *
+     * Obviously, this is a terrible hack making GVim depend on GTK's
+     * implementation details.  Therefore, watch out any relevant internal
+     * changes happening in GTK in the feature (sigh).
+     */
+    /* Follow-up
+     * After a few weeks later, the GdkWindow change mentioned above was
+     * reverted (https://git.gnome.org/browse/gtk+/commit/?h=gtk-3-22&id=f70039cb9603a02d2369fec4038abf40a1711155).
+     * The corresponding official release is 3.22.4. */
+    if (event->send_event == FALSE)
+	return TRUE;
+# endif
 
     if (event->width == cur_width && event->height == cur_height)
 	return TRUE;
@@ -3133,9 +3169,9 @@ delete_event_cb(GtkWidget *widget UNUSED,
     static int
 get_item_dimensions(GtkWidget *widget, GtkOrientation orientation)
 {
+# ifdef FEAT_GUI_GNOME
     GtkOrientation item_orientation = GTK_ORIENTATION_HORIZONTAL;
 
-# ifdef FEAT_GUI_GNOME
     if (using_gnome && widget != NULL)
     {
 	GtkWidget *parent;
@@ -3154,7 +3190,10 @@ get_item_dimensions(GtkWidget *widget, GtkOrientation orientation)
 	    item_orientation = bonobo_dock_item_get_orientation(dockitem);
 	}
     }
+# else
+#  define item_orientation GTK_ORIENTATION_HORIZONTAL
 # endif
+
 # if GTK_CHECK_VERSION(3,0,0)
     if (widget != NULL
 	    && item_orientation == orientation
@@ -3171,16 +3210,16 @@ get_item_dimensions(GtkWidget *widget, GtkOrientation orientation)
 	GtkAllocation allocation;
 
 	gtk_widget_get_allocation(widget, &allocation);
-
-	if (orientation == GTK_ORIENTATION_HORIZONTAL)
-	    return allocation.height;
-	else
-	    return allocation.width;
+	return allocation.height;
 # else
+#  ifdef FEAT_GUI_GNOME
 	if (orientation == GTK_ORIENTATION_HORIZONTAL)
 	    return widget->allocation.height;
 	else
 	    return widget->allocation.width;
+#  else
+	return widget->allocation.height;
+#  endif
 # endif
     }
     return 0;
@@ -3519,8 +3558,12 @@ on_tabline_menu(GtkWidget *widget, GdkEvent *event)
 	/* If the event was generated for 3rd button popup the menu. */
 	if (bevent->button == 3)
 	{
+# if GTK_CHECK_VERSION(3,22,2)
+	    gtk_menu_popup_at_pointer(GTK_MENU(widget), event);
+# else
 	    gtk_menu_popup(GTK_MENU(widget), NULL, NULL, NULL, NULL,
 						bevent->button, bevent->time);
+# endif
 	    /* We handled the event. */
 	    return TRUE;
 	}
@@ -3856,12 +3899,8 @@ gui_mch_init(void)
 	GtkWidget *plug;
 
 	/* Use GtkSocket from another app. */
-#ifdef HAVE_GTK_MULTIHEAD
 	plug = gtk_plug_new_for_display(gdk_display_get_default(),
 					gtk_socket_id);
-#else
-	plug = gtk_plug_new(gtk_socket_id);
-#endif
 #if GTK_CHECK_VERSION(3,0,0)
 	if (plug != NULL && gtk_plug_get_socket_window(GTK_PLUG(plug)) != NULL)
 #else
@@ -3921,10 +3960,10 @@ gui_mch_init(void)
     gtk_signal_connect(GTK_OBJECT(gui.mainwin), "realize",
 		       GTK_SIGNAL_FUNC(&mainwin_realize), NULL);
 #endif
-#ifdef HAVE_GTK_MULTIHEAD
-    g_signal_connect(G_OBJECT(gui.mainwin), "screen_changed",
+
+    g_signal_connect(G_OBJECT(gui.mainwin), "screen-changed",
 		     G_CALLBACK(&mainwin_screen_changed_cb), NULL);
-#endif
+
     gui.accel_group = gtk_accel_group_new();
     gtk_window_add_accel_group(GTK_WINDOW(gui.mainwin), gui.accel_group);
 
@@ -4116,6 +4155,9 @@ gui_mch_init(void)
 #endif
 
     gui.drawarea = gtk_drawing_area_new();
+#if GTK_CHECK_VERSION(3,22,2)
+    gtk_widget_set_name(gui.drawarea, "vim-gui-drawarea");
+#endif
 #if GTK_CHECK_VERSION(3,0,0)
     gui.surface = NULL;
     gui.by_signal = FALSE;
@@ -4167,8 +4209,13 @@ gui_mch_init(void)
 		     G_CALLBACK(drawarea_unrealize_cb), NULL);
     g_signal_connect(G_OBJECT(gui.drawarea), "configure-event",
 	    G_CALLBACK(drawarea_configure_event_cb), NULL);
+# if GTK_CHECK_VERSION(3,22,2)
+    g_signal_connect_after(G_OBJECT(gui.drawarea), "style-updated",
+			   G_CALLBACK(&drawarea_style_updated_cb), NULL);
+# else
     g_signal_connect_after(G_OBJECT(gui.drawarea), "style-set",
 			   G_CALLBACK(&drawarea_style_set_cb), NULL);
+# endif
 #else
     gtk_signal_connect(GTK_OBJECT(gui.drawarea), "realize",
 		       GTK_SIGNAL_FUNC(drawarea_realize_cb), NULL);
@@ -4384,14 +4431,34 @@ set_cairo_source_rgba_from_color(cairo_t *cr, guicolor_T color)
 gui_mch_new_colors(void)
 {
 #if GTK_CHECK_VERSION(3,0,0)
+# if !GTK_CHECK_VERSION(3,22,2)
     GdkWindow * const da_win = gtk_widget_get_window(gui.drawarea);
+# endif
 
     if (gui.drawarea != NULL && gtk_widget_get_window(gui.drawarea) != NULL)
 #else
     if (gui.drawarea != NULL && gui.drawarea->window != NULL)
 #endif
     {
-#if GTK_CHECK_VERSION(3,4,0)
+#if GTK_CHECK_VERSION(3,22,2)
+	GtkStyleContext * const context
+	    = gtk_widget_get_style_context(gui.drawarea);
+	GtkCssProvider * const provider = gtk_css_provider_new();
+	gchar * const css = g_strdup_printf(
+		"widget#vim-gui-drawarea {\n"
+		"  background-color: #%.2lx%.2lx%.2lx;\n"
+		"}\n",
+		 (gui.back_pixel >> 16) & 0xff,
+		 (gui.back_pixel >> 8) & 0xff,
+		 gui.back_pixel & 0xff);
+
+	gtk_css_provider_load_from_data(provider, css, -1, NULL);
+	gtk_style_context_add_provider(context,
+		GTK_STYLE_PROVIDER(provider), G_MAXUINT);
+
+	g_free(css);
+	g_object_unref(provider);
+#elif GTK_CHECK_VERSION(3,4,0) /* !GTK_CHECK_VERSION(3,22,2) */
 	GdkRGBA rgba;
 
 	rgba = color_to_rgba(gui.back_pixel);
@@ -4415,7 +4482,7 @@ gui_mch_new_colors(void)
 # else
 	gdk_window_set_background(gui.drawarea->window, &color);
 # endif
-#endif /* !GTK_CHECK_VERSION(3,4,0) */
+#endif /* !GTK_CHECK_VERSION(3,22,2) */
     }
 }
 
@@ -4428,6 +4495,30 @@ form_configure_event(GtkWidget *widget UNUSED,
 		     gpointer data UNUSED)
 {
     int usable_height = event->height;
+
+#if GTK_CHECK_VERSION(3,22,2) && !GTK_CHECK_VERSION(3,22,4)
+    /* As of 3.22.2, GdkWindows have started distributing configure events to
+     * their "native" children (https://git.gnome.org/browse/gtk+/commit/?h=gtk-3-22&id=12579fe71b3b8f79eb9c1b80e429443bcc437dd0).
+     *
+     * As can be seen from the implementation of move_native_children() and
+     * configure_native_child() in gdkwindow.c, those functions actually
+     * propagate configure events to every child, failing to distinguish
+     * "native" one from non-native one.
+     *
+     * Naturally, configure events propagated to here like that are fallacious
+     * and, as a matter of fact, they trigger a geometric collapse of
+     * gui.formwin.
+     *
+     * To filter out such fallacious events, check if the given event is the
+     * one that was sent out to the right place. Ignore it if not.
+     */
+    /* Follow-up
+     * After a few weeks later, the GdkWindow change mentioned above was
+     * reverted (https://git.gnome.org/browse/gtk+/commit/?h=gtk-3-22&id=f70039cb9603a02d2369fec4038abf40a1711155).
+     * The corresponding official release is 3.22.4. */
+    if (event->window != gtk_widget_get_window(gui.formwin))
+	return TRUE;
+#endif
 
     /* When in a GtkPlug, we can't guarantee valid heights (as a round
      * no. of char-heights), so we have to manually sanitise them.
@@ -4889,7 +4980,18 @@ gui_mch_set_shellsize(int width, int height,
     void
 gui_mch_get_screen_dimensions(int *screen_w, int *screen_h)
 {
-#ifdef HAVE_GTK_MULTIHEAD
+#if GTK_CHECK_VERSION(3,22,2)
+    GdkRectangle rect;
+    GdkMonitor * const mon = gdk_display_get_monitor_at_window(
+	    gtk_widget_get_display(gui.mainwin),
+	    gtk_widget_get_window(gui.mainwin));
+    gdk_monitor_get_geometry(mon, &rect);
+
+    *screen_w = rect.width;
+    /* Subtract 'guiheadroom' from the height to allow some room for the
+     * window manager (task list and window title bar). */
+    *screen_h = rect.height - p_ghr;
+#else
     GdkScreen* screen;
 
     if (gui.mainwin != NULL && gtk_widget_has_screen(gui.mainwin))
@@ -4898,12 +5000,9 @@ gui_mch_get_screen_dimensions(int *screen_w, int *screen_h)
 	screen = gdk_screen_get_default();
 
     *screen_w = gdk_screen_get_width(screen);
-    *screen_h = gdk_screen_get_height(screen) - p_ghr;
-#else
-    *screen_w = gdk_screen_width();
     /* Subtract 'guiheadroom' from the height to allow some room for the
      * window manager (task list and window title bar). */
-    *screen_h = gdk_screen_height() - p_ghr;
+    *screen_h = gdk_screen_get_height(screen) - p_ghr;
 #endif
 
     /*
@@ -6254,23 +6353,19 @@ gui_mch_get_display(void)
     void
 gui_mch_beep(void)
 {
-#ifdef HAVE_GTK_MULTIHEAD
     GdkDisplay *display;
 
-# if GTK_CHECK_VERSION(3,0,0)
+#if GTK_CHECK_VERSION(3,0,0)
     if (gui.mainwin != NULL && gtk_widget_get_realized(gui.mainwin))
-# else
+#else
     if (gui.mainwin != NULL && GTK_WIDGET_REALIZED(gui.mainwin))
-# endif
+#endif
 	display = gtk_widget_get_display(gui.mainwin);
     else
 	display = gdk_display_get_default();
 
     if (display != NULL)
 	gdk_display_beep(display);
-#else
-    gdk_beep();
-#endif
 }
 
     void
@@ -6617,16 +6712,12 @@ theend:
     void
 gui_mch_flush(void)
 {
-#ifdef HAVE_GTK_MULTIHEAD
-# if GTK_CHECK_VERSION(3,0,0)
+#if GTK_CHECK_VERSION(3,0,0)
     if (gui.mainwin != NULL && gtk_widget_get_realized(gui.mainwin))
-# else
-    if (gui.mainwin != NULL && GTK_WIDGET_REALIZED(gui.mainwin))
-# endif
-	gdk_display_flush(gtk_widget_get_display(gui.mainwin));
 #else
-    gdk_flush(); /* historical misnomer: calls XSync(), not XFlush() */
+    if (gui.mainwin != NULL && GTK_WIDGET_REALIZED(gui.mainwin))
 #endif
+	gdk_display_flush(gtk_widget_get_display(gui.mainwin));
 }
 
 /*
@@ -6634,8 +6725,14 @@ gui_mch_flush(void)
  * (row2, col2) inclusive.
  */
     void
-gui_mch_clear_block(int row1, int col1, int row2, int col2)
+gui_mch_clear_block(int row1arg, int col1arg, int row2arg, int col2arg)
 {
+
+    int col1 = check_col(col1arg);
+    int col2 = check_col(col2arg);
+    int row1 = check_row(row1arg);
+    int row2 = check_row(row2arg);
+
 #if GTK_CHECK_VERSION(3,0,0)
     if (gtk_widget_get_window(gui.drawarea) == NULL)
 	return;
@@ -6659,11 +6756,15 @@ gui_mch_clear_block(int row1, int col1, int row2, int col2)
 	};
 	GdkWindow * const win = gtk_widget_get_window(gui.drawarea);
 	cairo_t * const cr = cairo_create(gui.surface);
+# if GTK_CHECK_VERSION(3,22,2)
+	set_cairo_source_rgba_from_color(cr, gui.back_pixel);
+# else
 	cairo_pattern_t * const pat = gdk_window_get_background_pattern(win);
 	if (pat != NULL)
 	    cairo_set_source(cr, pat);
 	else
 	    set_cairo_source_rgba_from_color(cr, gui.back_pixel);
+# endif
 	gdk_cairo_rectangle(cr, &rect);
 	cairo_fill(cr);
 	cairo_destroy(cr);
@@ -6692,11 +6793,15 @@ gui_gtk_window_clear(GdkWindow *win)
 	0, 0, gdk_window_get_width(win), gdk_window_get_height(win)
     };
     cairo_t * const cr = cairo_create(gui.surface);
+# if GTK_CHECK_VERSION(3,22,2)
+    set_cairo_source_rgba_from_color(cr, gui.back_pixel);
+# else
     cairo_pattern_t * const pat = gdk_window_get_background_pattern(win);
     if (pat != NULL)
 	cairo_set_source(cr, pat);
     else
 	set_cairo_source_rgba_from_color(cr, gui.back_pixel);
+# endif
     gdk_cairo_rectangle(cr, &rect);
     cairo_fill(cr);
     cairo_destroy(cr);
@@ -7203,12 +7308,8 @@ mch_set_mouse_shape(int shape)
 	    id = mshape_ids[shape];
 	else
 	    return;
-# ifdef HAVE_GTK_MULTIHEAD
 	c = gdk_cursor_new_for_display(
 		gtk_widget_get_display(gui.drawarea), (GdkCursorType)id);
-# else
-	c = gdk_cursor_new((GdkCursorType)id);
-# endif
 # if GTK_CHECK_VERSION(3,0,0)
 	gdk_window_set_cursor(gtk_widget_get_window(gui.drawarea), c);
 # else

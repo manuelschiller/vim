@@ -7,26 +7,28 @@ func! ListMonths()
   if g:setting != ''
     exe ":set" g:setting
   endif
-  let mth=copy(g:months)
+  let mth = copy(g:months)
   let entered = strcharpart(getline('.'),0,col('.'))
   if !empty(entered)
-    let mth=filter(mth, 'v:val=~"^".entered')
+    let mth = filter(mth, 'v:val=~"^".entered')
   endif
   call complete(1, mth) 
   return ''
 endfunc
 
 func! Test_popup_complete2()
-  " Insert match immediately, if there is only one match
-  "  <c-e> Should select a character from the line below
-  " TODO: test disabled because the code change has been reverted.
-  throw "Skipped: Bug with <c-e> and popupmenu not fixed yet"
+  " Although the popupmenu is not visible, this does not mean completion mode
+  " has ended. After pressing <f5> to complete the currently typed char, Vim
+  " still stays in the first state of the completion (:h ins-completion-menu),
+  " although the popupmenu wasn't shown <c-e> will remove the inserted
+  " completed text (:h complete_CTRL-E), while the following <c-e> will behave
+  " like expected (:h i_CTRL-E)
   new
   inoremap <f5> <c-r>=ListMonths()<cr>
   call append(1, ["December2015"])
   :1
   call feedkeys("aD\<f5>\<C-E>\<C-E>\<C-E>\<C-E>\<enter>\<esc>", 'tx')
-  call assert_equal(["December2015", "", "December2015"], getline(1,3))
+  call assert_equal(["Dece", "", "December2015"], getline(1,3))
   %d
   bw!
 endfu
@@ -286,5 +288,329 @@ func Test_compl_vim_cmds_after_register_expr()
   augroup! AAAAA_Group
   bwipe!
 endfunc
+
+func DummyCompleteOne(findstart, base)
+  if a:findstart
+    return 0
+  else
+    wincmd n
+    return ['onedef', 'oneDEF']
+  endif
+endfunc
+
+" Test that nothing happens if the 'completefunc' opens
+" a new window (no completion, no crash)
+func Test_completefunc_opens_new_window_one()
+  new
+  let winid = win_getid()
+  setlocal completefunc=DummyCompleteOne
+  call setline(1, 'one')
+  /^one
+  call assert_fails('call feedkeys("A\<C-X>\<C-U>\<C-N>\<Esc>", "x")', 'E839:')
+  call assert_notequal(winid, win_getid())
+  q!
+  call assert_equal(winid, win_getid())
+  call assert_equal('', getline(1))
+  q!
+endfunc
+
+" Test that nothing happens if the 'completefunc' opens
+" a new window (no completion, no crash)
+func DummyCompleteTwo(findstart, base)
+  if a:findstart
+    wincmd n
+    return 0
+  else
+    return ['twodef', 'twoDEF']
+  endif
+endfunction
+
+" Test that nothing happens if the 'completefunc' opens
+" a new window (no completion, no crash)
+func Test_completefunc_opens_new_window_two()
+  new
+  let winid = win_getid()
+  setlocal completefunc=DummyCompleteTwo
+  call setline(1, 'two')
+  /^two
+  call assert_fails('call feedkeys("A\<C-X>\<C-U>\<C-N>\<Esc>", "x")', 'E764:')
+  call assert_notequal(winid, win_getid())
+  q!
+  call assert_equal(winid, win_getid())
+  call assert_equal('two', getline(1))
+  q!
+endfunc
+
+func DummyCompleteThree(findstart, base)
+  if a:findstart
+    return 0
+  else
+    return ['threedef', 'threeDEF']
+  endif
+endfunc
+
+:"Test that 'completefunc' works when it's OK.
+func Test_completefunc_works()
+  new
+  let winid = win_getid()
+  setlocal completefunc=DummyCompleteThree
+  call setline(1, 'three')
+  /^three
+  call feedkeys("A\<C-X>\<C-U>\<C-N>\<Esc>", "x")
+  call assert_equal(winid, win_getid())
+  call assert_equal('threeDEF', getline(1))
+  q!
+endfunc
+
+func DummyCompleteFour(findstart, base)
+  if a:findstart
+    return 0
+  else
+    call complete_add('four1')
+    call complete_add('four2')
+    call complete_check()
+    call complete_add('four3')
+    call complete_add('four4')
+    call complete_check()
+    call complete_add('four5')
+    call complete_add('four6')
+    return []
+  endif
+endfunc
+
+" Test that 'omnifunc' works when it's OK.
+func Test_omnifunc_with_check()
+  new
+  setlocal omnifunc=DummyCompleteFour
+  call setline(1, 'four')
+  /^four
+  call feedkeys("A\<C-X>\<C-O>\<C-N>\<Esc>", "x")
+  call assert_equal('four2', getline(1))
+
+  call setline(1, 'four')
+  /^four
+  call feedkeys("A\<C-X>\<C-O>\<C-N>\<C-N>\<Esc>", "x")
+  call assert_equal('four3', getline(1))
+
+  call setline(1, 'four')
+  /^four
+  call feedkeys("A\<C-X>\<C-O>\<C-N>\<C-N>\<C-N>\<C-N>\<Esc>", "x")
+  call assert_equal('four5', getline(1))
+
+  q!
+endfunc
+
+function UndoComplete()
+  call complete(1, ['January', 'February', 'March',
+        \ 'April', 'May', 'June', 'July', 'August', 'September',
+        \ 'October', 'November', 'December'])
+  return ''
+endfunc
+
+" Test that no undo item is created when no completion is inserted
+func Test_complete_no_undo()
+  set completeopt=menu,preview,noinsert,noselect
+  inoremap <Right> <C-R>=UndoComplete()<CR>
+  new
+  call feedkeys("ixxx\<CR>\<CR>yyy\<Esc>k", 'xt')
+  call feedkeys("iaaa\<Esc>0", 'xt')
+  call assert_equal('aaa', getline(2))
+  call feedkeys("i\<Right>\<Esc>", 'xt')
+  call assert_equal('aaa', getline(2))
+  call feedkeys("u", 'xt')
+  call assert_equal('', getline(2))
+
+  call feedkeys("ibbb\<Esc>0", 'xt')
+  call assert_equal('bbb', getline(2))
+  call feedkeys("A\<Right>\<Down>\<CR>\<Esc>", 'xt')
+  call assert_equal('January', getline(2))
+  call feedkeys("u", 'xt')
+  call assert_equal('bbb', getline(2))
+
+  call feedkeys("A\<Right>\<C-N>\<Esc>", 'xt')
+  call assert_equal('January', getline(2))
+  call feedkeys("u", 'xt')
+  call assert_equal('bbb', getline(2))
+
+  iunmap <Right>
+  set completeopt&
+  q!
+endfunc
+
+function! DummyCompleteFive(findstart, base)
+  if a:findstart
+    return 0
+  else
+    return [
+          \   { 'word': 'January', 'info': "info1-1\n1-2\n1-3" },
+          \   { 'word': 'February', 'info': "info2-1\n2-2\n2-3" },
+          \   { 'word': 'March', 'info': "info3-1\n3-2\n3-3" },
+          \   { 'word': 'April', 'info': "info4-1\n4-2\n4-3" },
+          \   { 'word': 'May', 'info': "info5-1\n5-2\n5-3" },
+          \ ]
+  endif
+endfunc
+
+" Test that 'completefunc' on Scratch buffer with preview window works when
+" it's OK.
+func Test_completefunc_with_scratch_buffer()
+  new +setlocal\ buftype=nofile\ bufhidden=wipe\ noswapfile
+  set completeopt+=preview
+  setlocal completefunc=DummyCompleteFive
+  call feedkeys("A\<C-X>\<C-U>\<C-N>\<C-N>\<C-N>\<Esc>", "x")
+  call assert_equal(['April'], getline(1, '$'))
+  pclose
+  q!
+  set completeopt&
+endfunc
+
+" <C-E> - select original typed text before the completion started without
+" auto-wrap text.
+func Test_completion_ctrl_e_without_autowrap()
+  new
+  let tw_save = &tw
+  set tw=78
+  let li = [
+        \ '"                                                        zzz',
+        \ '" zzzyyyyyyyyyyyyyyyyyyy']
+  call setline(1, li)
+  0
+  call feedkeys("A\<C-X>\<C-N>\<C-E>\<Esc>", "tx")
+  call assert_equal(li, getline(1, '$'))
+
+  let &tw = tw_save
+  q!
+endfunc
+
+function! DummyCompleteSix()
+  call complete(1, ['Hello', 'World'])
+  return ''
+endfunction
+
+" complete() correctly clears the list of autocomplete candidates
+" See #1411
+func Test_completion_clear_candidate_list()
+  new
+  %d
+  " select first entry from the completion popup
+  call feedkeys("a    xxx\<C-N>\<C-R>=DummyCompleteSix()\<CR>", "tx")
+  call assert_equal('Hello', getline(1))
+  %d
+  " select second entry from the completion popup
+  call feedkeys("a    xxx\<C-N>\<C-R>=DummyCompleteSix()\<CR>\<C-N>", "tx")
+  call assert_equal('World', getline(1))
+  %d
+  " select original text
+  call feedkeys("a    xxx\<C-N>\<C-R>=DummyCompleteSix()\<CR>\<C-N>\<C-N>", "tx")
+  call assert_equal('    xxx', getline(1))
+  %d
+  " back at first entry from completion list
+  call feedkeys("a    xxx\<C-N>\<C-R>=DummyCompleteSix()\<CR>\<C-N>\<C-N>\<C-N>", "tx")
+  call assert_equal('Hello', getline(1))
+
+  bw!
+endfunc
+
+func Test_completion_respect_bs_option()
+  new
+  let li = ["aaa", "aaa12345", "aaaabcdef", "aaaABC"]
+
+  set bs=indent,eol
+  call setline(1, li)
+  1
+  call feedkeys("A\<C-X>\<C-N>\<C-P>\<BS>\<BS>\<BS>\<Esc>", "tx")
+  call assert_equal('aaa', getline(1))
+
+  %d
+  set bs=indent,eol,start
+  call setline(1, li)
+  1
+  call feedkeys("A\<C-X>\<C-N>\<C-P>\<BS>\<BS>\<BS>\<Esc>", "tx")
+  call assert_equal('', getline(1))
+
+  bw!
+endfunc
+
+func CompleteUndo() abort
+  call complete(1, g:months)
+  return ''
+endfunc
+
+func Test_completion_can_undo()
+  inoremap <Right> <c-r>=CompleteUndo()<cr>
+  set completeopt+=noinsert,noselect
+
+  new
+  call feedkeys("a\<Right>a\<Esc>", 'xt')
+  call assert_equal('a', getline(1))
+  undo
+  call assert_equal('', getline(1))
+
+  bwipe!
+  set completeopt&
+  iunmap <Right>
+endfunc
+
+func Test_completion_comment_formatting()
+  new
+  setl formatoptions=tcqro
+  call feedkeys("o/*\<cr>\<cr>/\<esc>", 'tx')
+  call assert_equal(['', '/*', ' *', ' */'], getline(1,4))
+  %d
+  call feedkeys("o/*\<cr>foobar\<cr>/\<esc>", 'tx')
+  call assert_equal(['', '/*', ' * foobar', ' */'], getline(1,4))
+  %d
+  try
+    call feedkeys("o/*\<cr>\<cr>\<c-x>\<c-u>/\<esc>", 'tx')
+    call assert_report('completefunc not set, should have failed')
+  catch
+    call assert_exception('E764:')
+  endtry
+  call assert_equal(['', '/*', ' *', ' */'], getline(1,4))
+  bwipe!
+endfunc
+
+fun MessCompleteMonths()
+  for m in split("Jan Feb Mar Apr May Jun Jul Aug Sep")
+    call complete_add(m)
+    if complete_check()
+      break
+    endif
+  endfor
+  return []
+endfun
+
+fun MessCompleteMore()
+  call complete(1, split("Oct Nov Dec"))
+  return []
+endfun
+
+fun MessComplete(findstart, base)
+  if a:findstart
+    let line = getline('.')
+    let start = col('.') - 1
+    while start > 0 && line[start - 1] =~ '\a'
+      let start -= 1
+    endwhile
+    return start
+  else
+    call MessCompleteMonths()
+    call MessCompleteMore()
+    return []
+  endif
+endf
+
+func Test_complete_func_mess()
+  " Calling complete() after complete_add() in 'completefunc' is wrong, but it
+  " should not crash.
+  set completefunc=MessComplete
+  new
+  call setline(1, 'Ju')
+  call feedkeys("A\<c-x>\<c-u>/\<esc>", 'tx')
+  call assert_equal('Oct/Oct', getline(1))
+  bwipe!
+  set completefunc=
+endfunc
+
 
 " vim: shiftwidth=2 sts=2 expandtab

@@ -268,6 +268,11 @@
 # define UNUSED
 #endif
 
+/* Used to check for "sun", "__sun" is used by newer compilers. */
+#if defined(__sun)
+# define SUN_SYSTEM
+#endif
+
 /* if we're compiling in C++ (currently only KVim), the system
  * headers must have the correct prototypes or nothing will build.
  * conversely, our prototypes might clash due to throw() specifiers and
@@ -482,6 +487,9 @@ typedef unsigned long u8char_T;	    /* long should be 32 bits or more */
 # include <errno.h>
 #endif
 
+/* for INT_MAX et al. */
+#include <limits.h>
+
 /*
  * Allow other (non-unix) systems to configure themselves now
  * These are also in os_unix.h, because osdef.sh needs them there.
@@ -569,6 +577,7 @@ extern char *(*dyn_libintl_ngettext)(const char *msgid, const char *msgid_plural
 extern char *(*dyn_libintl_bindtextdomain)(const char *domainname, const char *dirname);
 extern char *(*dyn_libintl_bind_textdomain_codeset)(const char *domainname, const char *codeset);
 extern char *(*dyn_libintl_textdomain)(const char *domainname);
+extern int (*dyn_libintl_putenv)(const char *envstring);
 #endif
 
 
@@ -579,7 +588,7 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
 #ifdef FEAT_GETTEXT
 # ifdef DYNAMIC_GETTEXT
 #  define _(x) (*dyn_libintl_gettext)((char *)(x))
-#  define ngettext(x, xs, n) (*dyn_libintl_ngettext)((char *)(x), (char *)(xs), (n))
+#  define NGETTEXT(x, xs, n) (*dyn_libintl_ngettext)((char *)(x), (char *)(xs), (n))
 #  define N_(x) x
 #  define bindtextdomain(domain, dir) (*dyn_libintl_bindtextdomain)((domain), (dir))
 #  define bind_textdomain_codeset(domain, codeset) (*dyn_libintl_bind_textdomain_codeset)((domain), (codeset))
@@ -587,9 +596,12 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
 #   define HAVE_BIND_TEXTDOMAIN_CODESET 1
 #  endif
 #  define textdomain(domain) (*dyn_libintl_textdomain)(domain)
+#  define libintl_putenv(envstring) (*dyn_libintl_putenv)(envstring)
+#  define libintl_wputenv(envstring) (*dyn_libintl_wputenv)(envstring)
 # else
 #  include <libintl.h>
 #  define _(x) gettext((char *)(x))
+#  define NGETTEXT(x, xs, n) ngettext((x), (xs), (n))
 #  ifdef gettext_noop
 #   define N_(x) gettext_noop(x)
 #  else
@@ -598,7 +610,7 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
 # endif
 #else
 # define _(x) ((char *)(x))
-# define ngettext(x, xs, n) (((n) == 1) ? (char *)(x) : (char *)(xs))
+# define NGETTEXT(x, xs, n) (((n) == 1) ? (char *)(x) : (char *)(xs))
 # define N_(x) x
 # ifdef bindtextdomain
 #  undef bindtextdomain
@@ -618,6 +630,8 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
  * flags for update_screen()
  * The higher the value, the higher the priority
  */
+#define VALID_NO_UPDATE		 5  /* no new changes, keep the command line if
+				       possible */
 #define VALID			10  /* buffer not changed, or changes marked
 				       with b_mod_* */
 #define INVERTED		20  /* redisplay inverted part that changed */
@@ -793,6 +807,7 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
 #define EXPAND_SYNTIME		43
 #define EXPAND_USER_ADDR_TYPE	44
 #define EXPAND_PACKADD		45
+#define EXPAND_MESSAGES		46
 
 /* Values for exmode_active (0 is no exmode) */
 #define EXMODE_NORMAL		1
@@ -942,6 +957,14 @@ extern char *(*dyn_libintl_textdomain)(const char *domainname);
 #define GETF_SETMARK	0x01	/* set pcmark before jumping */
 #define GETF_ALT	0x02	/* jumping to alternate file (not buf num) */
 #define GETF_SWITCH	0x04	/* respect 'switchbuf' settings when jumping */
+
+/* Return values of getfile() */
+#define GETFILE_ERROR	    1	/* normal error */
+#define GETFILE_NOT_WRITTEN 2	/* "not written" error */
+#define GETFILE_SAME_FILE   0	/* success, same file */
+#define GETFILE_OPEN_OTHER -1	/* success, opened another file */
+#define GETFILE_UNUSED	    8
+#define GETFILE_SUCCESS(x)  ((x) <= 0)
 
 /* Values for buflist_new() flags */
 #define BLN_CURBUF	1	/* may re-use curbuf for new buffer */
@@ -1622,6 +1645,9 @@ typedef UINT32_TYPEDEF UINT32_T;
 #define EMSG3(s, p, q)		    emsg3((char_u *)(s), (char_u *)(p), (char_u *)(q))
 #define EMSGN(s, n)		    emsgn((char_u *)(s), (long)(n))
 #define EMSGU(s, n)		    emsgu((char_u *)(s), (long_u)(n))
+#define IEMSG(s)		    iemsg((char_u *)(s))
+#define IEMSG2(s, p)		    iemsg2((char_u *)(s), (char_u *)(p))
+#define IEMSGN(s, n)		    iemsgn((char_u *)(s), (long)(n))
 #define OUT_STR(s)		    out_str((char_u *)(s))
 #define OUT_STR_NF(s)		    out_str_nf((char_u *)(s))
 #define MSG_PUTS(s)		    msg_puts((char_u *)(s))
@@ -1703,15 +1729,8 @@ typedef unsigned short disptick_T;	/* display tick type */
 
 typedef void	    *vim_acl_T;		/* dummy to pass an ACL to a function */
 
-/*
- * Include a prototype for mch_memmove(), it may not be in alloc.pro.
- */
-#ifdef VIM_MEMMOVE
-void mch_memmove(void *, void *, size_t);
-#else
-# ifndef mch_memmove
-#  define mch_memmove(to, from, len) memmove(to, from, len)
-# endif
+#ifndef mch_memmove
+# define mch_memmove(to, from, len) memmove((char*)(to), (char*)(from), (size_t)(len))
 #endif
 
 /*
@@ -1727,17 +1746,6 @@ void mch_memmove(void *, void *, size_t);
 # define vim_memset(ptr, c, size)   memset((ptr), (c), (size))
 #else
 void *vim_memset(void *, int, size_t);
-#endif
-
-#ifdef HAVE_MEMCMP
-# define vim_memcmp(p1, p2, len)   memcmp((p1), (p2), (len))
-#else
-# ifdef HAVE_BCMP
-#  define vim_memcmp(p1, p2, len)   bcmp((p1), (p2), (len))
-# else
-int vim_memcmp(void *, void *, size_t);
-#  define VIM_MEMCMP
-# endif
 #endif
 
 #if defined(UNIX) || defined(FEAT_GUI) || defined(VMS) \
@@ -1763,14 +1771,8 @@ int vim_memcmp(void *, void *, size_t);
 /*
  * Enums need a typecast to be used as array index (for Ultrix).
  */
-#define hl_attr(n)	highlight_attr[(int)(n)]
-#define term_str(n)	term_strings[(int)(n)]
-
-/*
- * vim_iswhite() is used for "^" and the like. It differs from isspace()
- * because it doesn't include <CR> and <LF> and the like.
- */
-#define vim_iswhite(x)	((x) == ' ' || (x) == '\t')
+#define HL_ATTR(n)	highlight_attr[(int)(n)]
+#define TERM_STR(n)	term_strings[(int)(n)]
 
 /*
  * EXTERN is only defined in main.c.  That's where global variables are
@@ -2084,13 +2086,6 @@ typedef struct VimClipboard
 typedef int VimClipboard;	/* This is required for the prototypes. */
 #endif
 
-#ifdef __BORLANDC__
-/* work around a bug in the Borland 'stat' function: */
-# include <io.h>	    /* for access() */
-
-# define stat(a,b) (access(a,0) ? -1 : stat(a,b))
-#endif
-
 /* Use 64-bit stat structure if available. */
 #if (defined(_MSC_VER) && (_MSC_VER >= 1300)) || defined(__MINGW32__)
 # define HAVE_STAT64
@@ -2107,6 +2102,14 @@ typedef enum
     ASSERT_NOTMATCH,
     ASSERT_OTHER
 } assert_type_T;
+
+/* Mode for bracketed_paste(). */
+typedef enum {
+    PASTE_INSERT,	/* insert mode */
+    PASTE_CMDLINE,	/* command line */
+    PASTE_EX,		/* ex mode line */
+    PASTE_ONE_CHAR	/* return first character */
+} paste_mode_T;
 
 #include "ex_cmds.h"	    /* Ex command defines */
 #include "spell.h"	    /* spell checking stuff */
@@ -2140,7 +2143,7 @@ typedef enum
 #include "globals.h"	    /* global variables and messages */
 
 #ifndef FEAT_VIRTUALEDIT
-# define getvvcol(w, p, s, c, e) getvcol(w, p, s, c, e)
+# define getvvcol(w, p, s, c, e) getvcol((w), (p), (s), (c), (e))
 # define virtual_active() FALSE
 # define virtual_op FALSE
 #endif
@@ -2472,10 +2475,12 @@ typedef enum
 #define TFN_QUIET	2	/* no error messages */
 #define TFN_NO_AUTOLOAD	4	/* do not use script autoloading */
 #define TFN_NO_DEREF	8	/* do not dereference a Funcref */
+#define TFN_READ_ONLY	16	/* will not change the var */
 
 /* Values for get_lval() flags argument: */
 #define GLV_QUIET	TFN_QUIET	/* no error messages */
 #define GLV_NO_AUTOLOAD	TFN_NO_AUTOLOAD	/* do not use script autoloading */
+#define GLV_READ_ONLY	TFN_READ_ONLY	/* will not change the var */
 
 #define DO_NOT_FREE_CNT 99999	/* refcount for dict or list that should not
 				   be freed. */
@@ -2494,8 +2499,27 @@ typedef enum
 #define FNE_INCL_BR	1	/* include [] in name */
 #define FNE_CHECK_START	2	/* check name starts with valid character */
 
-#if (defined(sun) || defined(__FreeBSD__)) && defined(S_ISCHR)
+#if (defined(SUN_SYSTEM) || defined(__FreeBSD__) || defined(__FreeBSD_kernel__)) \
+	&& defined(S_ISCHR)
 # define OPEN_CHR_FILES
+#endif
+
+#if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
+# define ELAPSED_TIMEVAL
+# define ELAPSED_INIT(v) gettimeofday(&v, NULL)
+# define ELAPSED_FUNC(v) elapsed(&v)
+# define ELAPSED_TYPE struct timeval
+    long elapsed(struct timeval *start_tv);
+#else
+# if defined(WIN32)
+#  define ELAPSED_TICKCOUNT
+#  define ELAPSED_INIT(v) v = GetTickCount()
+#  define ELAPSED_FUNC(v) elapsed(v)
+#  define ELAPSED_TYPE DWORD
+#   ifndef PROTO
+     long elapsed(DWORD start_tick);
+#   endif
+# endif
 #endif
 
 #endif /* VIM__H */

@@ -50,6 +50,10 @@
 # endif
 #endif
 
+#ifdef FEAT_JOB_CHANNEL
+# include <tlhelp32.h>
+#endif
+
 #ifdef __MINGW32__
 # ifndef FROM_LEFT_1ST_BUTTON_PRESSED
 #  define FROM_LEFT_1ST_BUTTON_PRESSED    0x0001
@@ -141,42 +145,10 @@ typedef int LPSECURITY_ATTRIBUTES;
 # define __stdcall /* empty */
 #endif
 
-#ifndef FEAT_GUI_W32
-/* Undocumented API in kernel32.dll needed to work around dead key bug in
- * console-mode applications in NT 4.0.  If you switch keyboard layouts
- * in a console app to a layout that includes dead keys and then hit a
- * dead key, a call to ToAscii will trash the stack.  My thanks to Ian James
- * and Michael Dietrich for helping me figure out this workaround.
- */
-
-/* WINAPI BOOL WINAPI GetConsoleKeyboardLayoutNameA(LPSTR); */
-#ifndef WINAPI
-# define WINAPI __stdcall
-#endif
-#if defined(__BORLANDC__)
-typedef BOOL (__stdcall *PFNGCKLN)(LPSTR);
-#else
-typedef BOOL (WINAPI *PFNGCKLN)(LPSTR);
-#endif
-static PFNGCKLN    s_pfnGetConsoleKeyboardLayoutName = NULL;
-#endif
-
 #if defined(__BORLANDC__)
 /* Strangely Borland uses a non-standard name. */
 # define wcsicmp(a, b) wcscmpi((a), (b))
 #endif
-
-#ifndef PROTO
-
-/* Enable common dialogs input unicode from IME if possible. */
-#ifdef FEAT_MBYTE
-LRESULT (WINAPI *pDispatchMessage)(CONST MSG *) = DispatchMessage;
-BOOL (WINAPI *pGetMessage)(LPMSG, HWND, UINT, UINT) = GetMessage;
-BOOL (WINAPI *pIsDialogMessage)(HWND, LPMSG) = IsDialogMessage;
-BOOL (WINAPI *pPeekMessage)(LPMSG, HWND, UINT, UINT, UINT) = PeekMessage;
-#endif
-
-#endif /* PROTO */
 
 #ifndef FEAT_GUI_W32
 /* Win32 Console handles for input and output */
@@ -430,7 +402,6 @@ unescape_shellxquote(char_u *p, char_u *escaped)
 vimLoadLib(char *name)
 {
     HINSTANCE	dll = NULL;
-    char	old_dir[MAXPATHL];
 
     /* NOTE: Do not use mch_dirname() and mch_chdir() here, they may call
      * vimLoadLib() recursively, which causes a stack overflow. */
@@ -438,7 +409,6 @@ vimLoadLib(char *name)
 	get_exe_name();
     if (exe_path != NULL)
     {
-#ifdef FEAT_MBYTE
 	WCHAR old_dirw[MAXPATHL];
 
 	if (GetCurrentDirectoryW(MAXPATHL, old_dirw) != 0)
@@ -451,21 +421,87 @@ vimLoadLib(char *name)
 	    SetCurrentDirectoryW(old_dirw);
 	    return dll;
 	}
-	/* Retry with non-wide function (for Windows 98). */
-	if (GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-#endif
-	    if (GetCurrentDirectory(MAXPATHL, old_dir) != 0)
-	    {
-		/* Change directory to where the executable is, both to make
-		 * sure we find a .dll there and to avoid looking for a .dll
-		 * in the current directory. */
-		SetCurrentDirectory((LPCSTR)exe_path);
-		dll = LoadLibrary(name);
-		SetCurrentDirectory(old_dir);
-	    }
     }
     return dll;
 }
+
+#if defined(DYNAMIC_ICONV) || defined(DYNAMIC_GETTEXT) || defined(PROTO)
+/*
+ * Get related information about 'funcname' which is imported by 'hInst'.
+ * If 'info' is 0, return the function address.
+ * If 'info' is 1, return the module name which the function is imported from.
+ */
+    static void *
+get_imported_func_info(HINSTANCE hInst, const char *funcname, int info)
+{
+    PBYTE			pImage = (PBYTE)hInst;
+    PIMAGE_DOS_HEADER		pDOS = (PIMAGE_DOS_HEADER)hInst;
+    PIMAGE_NT_HEADERS		pPE;
+    PIMAGE_IMPORT_DESCRIPTOR	pImpDesc;
+    PIMAGE_THUNK_DATA		pIAT;	    /* Import Address Table */
+    PIMAGE_THUNK_DATA		pINT;	    /* Import Name Table */
+    PIMAGE_IMPORT_BY_NAME	pImpName;
+
+    if (pDOS->e_magic != IMAGE_DOS_SIGNATURE)
+	return NULL;
+    pPE = (PIMAGE_NT_HEADERS)(pImage + pDOS->e_lfanew);
+    if (pPE->Signature != IMAGE_NT_SIGNATURE)
+	return NULL;
+    pImpDesc = (PIMAGE_IMPORT_DESCRIPTOR)(pImage
+	    + pPE->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT]
+							    .VirtualAddress);
+    for (; pImpDesc->FirstThunk; ++pImpDesc)
+    {
+	if (!pImpDesc->OriginalFirstThunk)
+	    continue;
+	pIAT = (PIMAGE_THUNK_DATA)(pImage + pImpDesc->FirstThunk);
+	pINT = (PIMAGE_THUNK_DATA)(pImage + pImpDesc->OriginalFirstThunk);
+	for (; pIAT->u1.Function; ++pIAT, ++pINT)
+	{
+	    if (IMAGE_SNAP_BY_ORDINAL(pINT->u1.Ordinal))
+		continue;
+	    pImpName = (PIMAGE_IMPORT_BY_NAME)(pImage
+					+ (UINT_PTR)(pINT->u1.AddressOfData));
+	    if (strcmp((char *)pImpName->Name, funcname) == 0)
+	    {
+		switch (info)
+		{
+		    case 0:
+			return (void *)pIAT->u1.Function;
+		    case 1:
+			return (void *)(pImage + pImpDesc->Name);
+		    default:
+			return NULL;
+		}
+	    }
+	}
+    }
+    return NULL;
+}
+
+/*
+ * Get the module handle which 'funcname' in 'hInst' is imported from.
+ */
+    HINSTANCE
+find_imported_module_by_funcname(HINSTANCE hInst, const char *funcname)
+{
+    char    *modulename;
+
+    modulename = (char *)get_imported_func_info(hInst, funcname, 1);
+    if (modulename != NULL)
+	return GetModuleHandleA(modulename);
+    return NULL;
+}
+
+/*
+ * Get the address of 'funcname' which is imported by 'hInst' DLL.
+ */
+    void *
+get_dll_import_func(HINSTANCE hInst, const char *funcname)
+{
+    return get_imported_func_info(hInst, funcname, 0);
+}
+#endif
 
 #if defined(DYNAMIC_GETTEXT) || defined(PROTO)
 # ifndef GETTEXT_DLL
@@ -478,6 +514,8 @@ static char *null_libintl_ngettext(const char *, const char *, unsigned long n);
 static char *null_libintl_textdomain(const char *);
 static char *null_libintl_bindtextdomain(const char *, const char *);
 static char *null_libintl_bind_textdomain_codeset(const char *, const char *);
+static int null_libintl_putenv(const char *);
+static int null_libintl_wputenv(const wchar_t *);
 
 static HINSTANCE hLibintlDLL = NULL;
 char *(*dyn_libintl_gettext)(const char *) = null_libintl_gettext;
@@ -488,6 +526,8 @@ char *(*dyn_libintl_bindtextdomain)(const char *, const char *)
 						= null_libintl_bindtextdomain;
 char *(*dyn_libintl_bind_textdomain_codeset)(const char *, const char *)
 				       = null_libintl_bind_textdomain_codeset;
+int (*dyn_libintl_putenv)(const char *) = null_libintl_putenv;
+int (*dyn_libintl_wputenv)(const wchar_t *) = null_libintl_wputenv;
 
     int
 dyn_libintl_init(void)
@@ -505,6 +545,7 @@ dyn_libintl_init(void)
 	{"bindtextdomain", (FARPROC*)&dyn_libintl_bindtextdomain},
 	{NULL, NULL}
     };
+    HINSTANCE hmsvcrt;
 
     /* No need to initialize twice. */
     if (hLibintlDLL)
@@ -549,6 +590,18 @@ dyn_libintl_init(void)
 	dyn_libintl_bind_textdomain_codeset =
 					 null_libintl_bind_textdomain_codeset;
 
+    /* _putenv() function for the libintl.dll is optional. */
+    hmsvcrt = find_imported_module_by_funcname(hLibintlDLL, "getenv");
+    if (hmsvcrt != NULL)
+    {
+	dyn_libintl_putenv = (void *)GetProcAddress(hmsvcrt, "_putenv");
+	dyn_libintl_wputenv = (void *)GetProcAddress(hmsvcrt, "_wputenv");
+    }
+    if (dyn_libintl_putenv == NULL || dyn_libintl_putenv == _putenv)
+	dyn_libintl_putenv = null_libintl_putenv;
+    if (dyn_libintl_wputenv == NULL || dyn_libintl_wputenv == _wputenv)
+	dyn_libintl_wputenv = null_libintl_wputenv;
+
     return 1;
 }
 
@@ -563,16 +616,16 @@ dyn_libintl_end(void)
     dyn_libintl_textdomain	= null_libintl_textdomain;
     dyn_libintl_bindtextdomain	= null_libintl_bindtextdomain;
     dyn_libintl_bind_textdomain_codeset = null_libintl_bind_textdomain_codeset;
+    dyn_libintl_putenv		= null_libintl_putenv;
+    dyn_libintl_wputenv		= null_libintl_wputenv;
 }
 
-/*ARGSUSED*/
     static char *
 null_libintl_gettext(const char *msgid)
 {
     return (char*)msgid;
 }
 
-/*ARGSUSED*/
     static char *
 null_libintl_ngettext(
 	const char *msgid,
@@ -582,26 +635,38 @@ null_libintl_ngettext(
     return (char *)(n == 1 ? msgid : msgid_plural);
 }
 
-/*ARGSUSED*/
     static char *
-null_libintl_bindtextdomain(const char *domainname, const char *dirname)
+null_libintl_bindtextdomain(
+	const char *domainname UNUSED,
+	const char *dirname UNUSED)
 {
     return NULL;
 }
 
-/*ARGSUSED*/
     static char *
-null_libintl_bind_textdomain_codeset(const char *domainname,
-							  const char *codeset)
+null_libintl_bind_textdomain_codeset(
+	const char *domainname UNUSED,
+	const char *codeset UNUSED)
 {
     return NULL;
 }
 
-/*ARGSUSED*/
     static char *
-null_libintl_textdomain(const char *domainname)
+null_libintl_textdomain(const char *domainname UNUSED)
 {
     return NULL;
+}
+
+    int
+null_libintl_putenv(const char *envstring UNUSED)
+{
+    return 0;
+}
+
+    int
+null_libintl_wputenv(const wchar_t *envstring UNUSED)
+{
+    return 0;
 }
 
 #endif /* DYNAMIC_GETTEXT */
@@ -621,37 +686,7 @@ DWORD g_PlatformId;
 # ifndef PROTECTED_DACL_SECURITY_INFORMATION
 #  define PROTECTED_DACL_SECURITY_INFORMATION	0x80000000L
 # endif
-
-/*
- * These are needed to dynamically load the ADVAPI DLL, which is not
- * implemented under Windows 95 (and causes VIM to crash)
- */
-typedef DWORD (WINAPI *PSNSECINFO) (LPSTR, SE_OBJECT_TYPE,
-	SECURITY_INFORMATION, PSID, PSID, PACL, PACL);
-typedef DWORD (WINAPI *PGNSECINFO) (LPSTR, SE_OBJECT_TYPE,
-	SECURITY_INFORMATION, PSID *, PSID *, PACL *, PACL *,
-	PSECURITY_DESCRIPTOR *);
-# ifdef FEAT_MBYTE
-typedef DWORD (WINAPI *PSNSECINFOW) (LPWSTR, SE_OBJECT_TYPE,
-	SECURITY_INFORMATION, PSID, PSID, PACL, PACL);
-typedef DWORD (WINAPI *PGNSECINFOW) (LPWSTR, SE_OBJECT_TYPE,
-	SECURITY_INFORMATION, PSID *, PSID *, PACL *, PACL *,
-	PSECURITY_DESCRIPTOR *);
-# endif
-
-static HANDLE advapi_lib = NULL;	/* Handle for ADVAPI library */
-static PSNSECINFO pSetNamedSecurityInfo;
-static PGNSECINFO pGetNamedSecurityInfo;
-# ifdef FEAT_MBYTE
-static PSNSECINFOW pSetNamedSecurityInfoW;
-static PGNSECINFOW pGetNamedSecurityInfoW;
-# endif
 #endif
-
-typedef BOOL (WINAPI *PSETHANDLEINFORMATION)(HANDLE, DWORD, DWORD);
-
-static BOOL allowPiping = FALSE;
-static PSETHANDLEINFORMATION pSetHandleInformation;
 
 #ifdef HAVE_ACL
 /*
@@ -712,92 +747,12 @@ PlatformId(void)
 	    win8_or_later = TRUE;
 
 #ifdef HAVE_ACL
-	/*
-	 * Load the ADVAPI runtime if we are on anything
-	 * other than Windows 95
-	 */
-	if (g_PlatformId == VER_PLATFORM_WIN32_NT)
-	{
-	    /*
-	     * do this load.  Problems: Doesn't unload at end of run (this is
-	     * theoretically okay, since Windows should unload it when VIM
-	     * terminates).  Should we be using the 'mch_libcall' routines?
-	     * Seems like a lot of overhead to load/unload ADVAPI32.DLL each
-	     * time we verify security...
-	     */
-	    advapi_lib = vimLoadLib("ADVAPI32.DLL");
-	    if (advapi_lib != NULL)
-	    {
-		pSetNamedSecurityInfo = (PSNSECINFO)GetProcAddress(advapi_lib,
-						      "SetNamedSecurityInfoA");
-		pGetNamedSecurityInfo = (PGNSECINFO)GetProcAddress(advapi_lib,
-						      "GetNamedSecurityInfoA");
-# ifdef FEAT_MBYTE
-		pSetNamedSecurityInfoW = (PSNSECINFOW)GetProcAddress(advapi_lib,
-						      "SetNamedSecurityInfoW");
-		pGetNamedSecurityInfoW = (PGNSECINFOW)GetProcAddress(advapi_lib,
-						      "GetNamedSecurityInfoW");
-# endif
-		if (pSetNamedSecurityInfo == NULL
-			|| pGetNamedSecurityInfo == NULL
-# ifdef FEAT_MBYTE
-			|| pSetNamedSecurityInfoW == NULL
-			|| pGetNamedSecurityInfoW == NULL
-# endif
-			)
-		{
-		    /* If we can't get the function addresses, set advapi_lib
-		     * to NULL so that we don't use them. */
-		    FreeLibrary(advapi_lib);
-		    advapi_lib = NULL;
-		}
-		/* Enable privilege for getting or setting SACLs. */
-		win32_enable_privilege(SE_SECURITY_NAME, TRUE);
-	    }
-	}
+	/* Enable privilege for getting or setting SACLs. */
+	win32_enable_privilege(SE_SECURITY_NAME, TRUE);
 #endif
-	/*
-	 * If we are on windows NT, try to load the pipe functions, only
-	 * available from Win2K.
-	 */
-	if (g_PlatformId == VER_PLATFORM_WIN32_NT)
-	{
-	    HANDLE kernel32 = GetModuleHandle("kernel32");
-	    pSetHandleInformation = (PSETHANDLEINFORMATION)GetProcAddress(
-					    kernel32, "SetHandleInformation");
-
-	    allowPiping = pSetHandleInformation != NULL;
-	}
 	done = TRUE;
     }
 }
-
-/*
- * Return TRUE when running on Windows 95 (or 98 or ME).
- * Only to be used after mch_init().
- */
-    int
-mch_windows95(void)
-{
-    return g_PlatformId == VER_PLATFORM_WIN32_WINDOWS;
-}
-
-#ifdef FEAT_GUI_W32
-/*
- * Used to work around the "can't do synchronous spawn"
- * problem on Win32s, without resorting to Universal Thunk.
- */
-static int old_num_windows;
-static int num_windows;
-
-/*ARGSUSED*/
-    static BOOL CALLBACK
-win32ssynch_cb(HWND hwnd, LPARAM lparam)
-{
-    num_windows++;
-    return TRUE;
-}
-#endif
 
 #ifndef FEAT_GUI_W32
 
@@ -925,15 +880,6 @@ win32_kbd_patch_key(
 	return 1;
 
     vim_memset(abKeystate, 0, sizeof (abKeystate));
-
-    // Should only be non-NULL on NT 4.0
-    if (s_pfnGetConsoleKeyboardLayoutName != NULL)
-    {
-	CHAR szKLID[KL_NAMELENGTH];
-
-	if ((*s_pfnGetConsoleKeyboardLayoutName)(szKLID))
-	    (void)LoadKeyboardLayout(szKLID, KLF_ACTIVATE);
-    }
 
     /* Clear any pending dead keys */
     ToUnicode(VK_SPACE, MapVirtualKey(VK_SPACE, 0), abKeystate, awAnsiCode, 2, 0);
@@ -1110,9 +1056,8 @@ decode_key_event(
  * For the GUI the mouse handling is in gui_w32.c.
  */
 # ifdef FEAT_GUI_W32
-/*ARGSUSED*/
     void
-mch_setmouse(int on)
+mch_setmouse(int on UNUSED)
 {
 }
 # else
@@ -1512,8 +1457,20 @@ WaitForChar(long msec)
 	    DWORD dwWaitTime = dwEndTime - dwNow;
 
 #ifdef FEAT_JOB_CHANNEL
-	    /* Check channel while waiting input. */
+	    /* Check channel while waiting for input. */
 	    if (dwWaitTime > 100)
+	    {
+		dwWaitTime = 100;
+		/* If there is readahead then parse_queued_messages() timed out
+		 * and we should call it again soon. */
+		if (channel_any_readahead())
+		    dwWaitTime = 10;
+	    }
+#endif
+#ifdef FEAT_BEVAL
+	    if (p_beval && dwWaitTime > 100)
+		/* The 'balloonexpr' may indirectly invoke a callback while
+		 * waiting for a character, need to check often. */
 		dwWaitTime = 100;
 #endif
 #ifdef FEAT_MZSCHEME
@@ -1702,13 +1659,12 @@ tgetch(int *pmodifiers, WCHAR *pch2)
  * If time == -1, wait forever for characters.
  * Returns the number of characters read into buf.
  */
-/*ARGSUSED*/
     int
 mch_inchar(
-    char_u	*buf,
-    int		maxlen,
-    long	time,
-    int		tb_change_cnt)
+    char_u	*buf UNUSED,
+    int		maxlen UNUSED,
+    long	time UNUSED,
+    int		tb_change_cnt UNUSED)
 {
 #ifndef FEAT_GUI_W32	    /* this isn't used for the GUI */
 
@@ -1946,16 +1902,35 @@ theend:
 #endif
 
 /*
- * Return TRUE if "name" is in $PATH.
+ * If "use_path" is TRUE: Return TRUE if "name" is in $PATH.
+ * If "use_path" is FALSE: Return TRUE if "name" exists.
+ * When returning TRUE and "path" is not NULL save the path and set "*path" to
+ * the allocated memory.
  * TODO: Should somehow check if it's really executable.
  */
     static int
-executable_exists(char *name, char_u **path)
+executable_exists(char *name, char_u **path, int use_path)
 {
     char	*dum;
     char	fname[_MAX_PATH];
     char	*curpath, *newpath;
     long	n;
+
+    if (!use_path)
+    {
+	if (mch_getperm((char_u *)name) != -1 && !mch_isdir((char_u *)name))
+	{
+	    if (path != NULL)
+	    {
+		if (mch_isFullName((char_u *)name))
+		    *path = vim_strsave((char_u *)name);
+		else
+		    *path = FullName_save((char_u *)name, FALSE);
+	    }
+	    return TRUE;
+	}
+	return FALSE;
+    }
 
 #ifdef FEAT_MBYTE
     if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
@@ -1977,17 +1952,13 @@ executable_exists(char *name, char_u **path)
 	    n = (long)SearchPathW(wnewpath, p, NULL, _MAX_PATH, fnamew, &dumw);
 	    vim_free(wnewpath);
 	    vim_free(p);
-	    if (n > 0 || GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-	    {
-		if (n == 0)
-		    return FALSE;
-		if (GetFileAttributesW(fnamew) & FILE_ATTRIBUTE_DIRECTORY)
-		    return FALSE;
-		if (path != NULL)
-		    *path = utf16_to_enc(fnamew, NULL);
-		return TRUE;
-	    }
-	    /* Retry with non-wide function (for Windows 98). */
+	    if (n == 0)
+		return FALSE;
+	    if (GetFileAttributesW(fnamew) & FILE_ATTRIBUTE_DIRECTORY)
+		return FALSE;
+	    if (path != NULL)
+		*path = utf16_to_enc(fnamew, NULL);
+	    return TRUE;
 	}
     }
 #endif
@@ -2086,7 +2057,7 @@ mch_init(void)
 	    vimrun_path = (char *)vim_strsave(vimrun_location);
 	    s_dont_use_vimrun = FALSE;
 	}
-	else if (executable_exists("vimrun.exe", NULL))
+	else if (executable_exists("vimrun.exe", NULL, TRUE))
 	    s_dont_use_vimrun = FALSE;
 
 	/* Don't give the warning for a missing vimrun.exe right now, but only
@@ -2100,7 +2071,7 @@ mch_init(void)
      * If "finstr.exe" doesn't exist, use "grep -n" for 'grepprg'.
      * Otherwise the default "findstr /n" is used.
      */
-    if (!executable_exists("findstr.exe", NULL))
+    if (!executable_exists("findstr.exe", NULL, TRUE))
 	set_option_value((char_u *)"grepprg", 0, (char_u *)"grep -n", 0);
 
 #ifdef FEAT_CLIPBOARD
@@ -2462,8 +2433,6 @@ SetConsoleIcon(
     static void
 SaveConsoleTitleAndIcon(void)
 {
-    GETCONSOLEWINDOWPROC GetConsoleWindowProc;
-
     /* Save the original title. */
     if (!GetConsoleTitle(g_szOrigTitle, sizeof(g_szOrigTitle)))
 	return;
@@ -2475,12 +2444,7 @@ SaveConsoleTitleAndIcon(void)
      * 2000.  On older operating systems, we can't change the window icon
      * anyway.
      */
-    if ((GetConsoleWindowProc = (GETCONSOLEWINDOWPROC)
-	    GetProcAddress(GetModuleHandle("KERNEL32.DLL"),
-		    "GetConsoleWindow")) != NULL)
-    {
-	g_hWnd = (*GetConsoleWindowProc)();
-    }
+    g_hWnd = GetConsoleWindow();
     if (g_hWnd == NULL)
 	return;
 
@@ -2589,11 +2553,6 @@ mch_init(void)
 #ifdef FEAT_CLIPBOARD
     win_clip_init();
 #endif
-
-    /* This will be NULL on anything but NT 4.0 */
-    s_pfnGetConsoleKeyboardLayoutName =
-	(PFNGCKLN) GetProcAddress(GetModuleHandle("kernel32.dll"),
-				  "GetConsoleKeyboardLayoutNameA");
 }
 
 /*
@@ -2604,8 +2563,9 @@ mch_init(void)
     void
 mch_exit(int r)
 {
-    stoptermcap();
+    exiting = TRUE;
 
+    stoptermcap();
     if (g_fWindInitCalled)
 	settmode(TMODE_COOK);
 
@@ -2652,11 +2612,10 @@ mch_exit(int r)
 /*
  * Do we have an interactive window?
  */
-/*ARGSUSED*/
     int
 mch_check_win(
-    int argc,
-    char **argv)
+    int argc UNUSED,
+    char **argv UNUSED)
 {
     get_exe_name();
 
@@ -2775,9 +2734,6 @@ fname_casew(
 	    *porig = c;
 	    ptrue = ptruePrev + wcslen(ptruePrev);
 	}
-	else if (hFind == INVALID_HANDLE_VALUE
-		&& GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	    return FAIL;
     }
 
     wcscpy(name, szTrueName);
@@ -2836,7 +2792,7 @@ fname_case(
 		}
 	    }
 	}
-	/* Retry with non-wide function (for Windows 98). */
+	return;
     }
 #endif
 
@@ -2966,9 +2922,6 @@ mch_get_user_name(
 		return OK;
 	    }
 	}
-	else if (GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-	    return FAIL;
-	/* Retry with non-wide function (for Windows 98). */
     }
 #endif
     if (GetUserName(szUserName, &cch))
@@ -3008,9 +2961,6 @@ mch_get_host_name(
 		return;
 	    }
 	}
-	else if (GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-	    return;
-	/* Retry with non-wide function (for Windows 98). */
     }
 #endif
     if (!GetComputerName((LPSTR)s, &cch))
@@ -3059,9 +3009,7 @@ mch_dirname(
 		return OK;
 	    }
 	}
-	else if (GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-	    return FAIL;
-	/* Retry with non-wide function (for Windows 98). */
+	return FAIL;
     }
 #endif
     return (GetCurrentDirectory(len, (LPSTR)buf) != 0 ? OK : FAIL);
@@ -3101,9 +3049,8 @@ mch_setperm(char_u *name, long perm)
 	{
 	    n = _wchmod(p, perm);
 	    vim_free(p);
-	    if (n == -1 && g_PlatformId == VER_PLATFORM_WIN32_NT)
+	    if (n == -1)
 		return FAIL;
-	    /* Retry with non-wide function (for Windows 98). */
 	}
     }
     if (n == -1)
@@ -3251,18 +3198,7 @@ mch_is_symbolic_link(char_u *name)
     {
 	hFind = FindFirstFileW(wn, &findDataW);
 	vim_free(wn);
-	if (hFind == INVALID_HANDLE_VALUE
-		&& GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	{
-	    /* Retry with non-wide function (for Windows 98). */
-	    hFind = FindFirstFile((LPCSTR)name, &findDataA);
-	    if (hFind != INVALID_HANDLE_VALUE)
-	    {
-		fileFlags = findDataA.dwFileAttributes;
-		reparseTag = findDataA.dwReserved0;
-	    }
-	}
-	else
+	if (hFind != INVALID_HANDLE_VALUE)
 	{
 	    fileFlags = findDataW.dwFileAttributes;
 	    reparseTag = findDataW.dwReserved0;
@@ -3321,7 +3257,7 @@ win32_fileinfo(char_u *fname, BY_HANDLE_FILE_INFORMATION *info)
     {
 	wn = enc_to_utf16(fname, NULL);
 	if (wn == NULL)
-	    res = FILEINFO_ENC_FAIL;
+	    return FILEINFO_ENC_FAIL;
     }
     if (wn != NULL)
     {
@@ -3332,15 +3268,9 @@ win32_fileinfo(char_u *fname, BY_HANDLE_FILE_INFORMATION *info)
 		    OPEN_EXISTING,	/* creation disposition */
 		    FILE_FLAG_BACKUP_SEMANTICS,	/* file attributes */
 		    NULL);		/* handle to template file */
-	if (hFile == INVALID_HANDLE_VALUE
-			      && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	{
-	    /* Retry with non-wide function (for Windows 98). */
-	    vim_free(wn);
-	    wn = NULL;
-	}
+	vim_free(wn);
     }
-    if (wn == NULL)
+    else
 #endif
 	hFile = CreateFile((LPCSTR)fname,    /* file name */
 		    GENERIC_READ,	    /* access mode */
@@ -3359,9 +3289,6 @@ win32_fileinfo(char_u *fname, BY_HANDLE_FILE_INFORMATION *info)
 	CloseHandle(hFile);
     }
 
-#ifdef FEAT_MBYTE
-    vim_free(wn);
-#endif
     return res;
 }
 
@@ -3383,19 +3310,12 @@ win32_getattrs(char_u *name)
     if (p != NULL)
     {
 	attr = GetFileAttributesW(p);
-	if (attr < 0 && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	{
-	    /* Retry with non-wide function (for Windows 98). */
-	    vim_free(p);
-	    p = NULL;
-	}
+	vim_free(p);
     }
-    if (p == NULL)
+    else
 #endif
 	attr = GetFileAttributes((char *)name);
-#ifdef FEAT_MBYTE
-    vim_free(p);
-#endif
+
     return attr;
 }
 
@@ -3418,20 +3338,12 @@ win32_setattrs(char_u *name, int attrs)
     if (p != NULL)
     {
 	res = SetFileAttributesW(p, attrs);
-	if (res == FALSE
-	    && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	{
-	    /* Retry with non-wide function (for Windows 98). */
-	    vim_free(p);
-	    p = NULL;
-	}
+	vim_free(p);
     }
-    if (p == NULL)
+    else
 #endif
 	res = SetFileAttributes((char *)name, attrs);
-#ifdef FEAT_MBYTE
-    vim_free(p);
-#endif
+
     return res ? 0 : -1;
 }
 
@@ -3465,9 +3377,10 @@ mch_writable(char_u *name)
 }
 
 /*
- * Return 1 if "name" can be executed, 0 if not.
+ * Return TRUE if "name" can be executed, FALSE if not.
  * If "use_path" is FALSE only check if "name" is executable.
- * Return -1 if unknown.
+ * When returning TRUE and "path" is not NULL save the path and set "*path" to
+ * the allocated memory.
  */
     int
 mch_can_exe(char_u *name, char_u **path, int use_path)
@@ -3478,17 +3391,12 @@ mch_can_exe(char_u *name, char_u **path, int use_path)
 
     if (len >= _MAX_PATH)	/* safety check */
 	return FALSE;
-    if (!use_path)
-    {
-	/* TODO: check if file is really executable. */
-	return mch_getperm(name) != -1 && !mch_isdir(name);
-    }
 
     /* If there already is an extension try using the name directly.  Also do
      * this with a Unix-shell like 'shell'. */
     if (vim_strchr(gettail(name), '.') != NULL
 			       || strstr((char *)gettail(p_sh), "sh") != NULL)
-	if (executable_exists((char *)name, path))
+	if (executable_exists((char *)name, path, use_path))
 	    return TRUE;
 
     /*
@@ -3510,7 +3418,7 @@ mch_can_exe(char_u *name, char_u **path, int use_path)
 	}
 	else
 	    copy_option_part(&p, buf + len, _MAX_PATH - len, ";");
-	if (executable_exists((char *)buf, path))
+	if (executable_exists((char *)buf, path, use_path))
 	    return TRUE;
     }
     return FALSE;
@@ -3539,27 +3447,20 @@ mch_nodetype(char_u *name)
 
 #ifdef FEAT_MBYTE
     if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
-    {
 	wn = enc_to_utf16(name, NULL);
-	if (wn != NULL)
-	{
-	    hFile = CreateFileW(wn,	/* file name */
-			GENERIC_WRITE,	/* access mode */
-			0,		/* share mode */
-			NULL,		/* security descriptor */
-			OPEN_EXISTING,	/* creation disposition */
-			0,		/* file attributes */
-			NULL);		/* handle to template file */
-	    if (hFile == INVALID_HANDLE_VALUE
-			      && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	    {
-		/* Retry with non-wide function (for Windows 98). */
-		vim_free(wn);
-		wn = NULL;
-	    }
-	}
+
+    if (wn != NULL)
+    {
+	hFile = CreateFileW(wn,		    /* file name */
+		    GENERIC_WRITE,	    /* access mode */
+		    0,			    /* share mode */
+		    NULL,		    /* security descriptor */
+		    OPEN_EXISTING,	    /* creation disposition */
+		    0,			    /* file attributes */
+		    NULL);		    /* handle to template file */
+	vim_free(wn);
     }
-    if (wn == NULL)
+    else
 #endif
 	hFile = CreateFile((LPCSTR)name,    /* file name */
 		    GENERIC_WRITE,	    /* access mode */
@@ -3569,9 +3470,6 @@ mch_nodetype(char_u *name)
 		    0,			    /* file attributes */
 		    NULL);		    /* handle to template file */
 
-#ifdef FEAT_MBYTE
-    vim_free(wn);
-#endif
     if (hFile == INVALID_HANDLE_VALUE)
 	return NODE_NORMAL;
 
@@ -3608,88 +3506,84 @@ mch_get_acl(char_u *fname)
     struct my_acl   *p = NULL;
     DWORD   err;
 
-    /* This only works on Windows NT and 2000. */
-    if (g_PlatformId == VER_PLATFORM_WIN32_NT && advapi_lib != NULL)
+    p = (struct my_acl *)alloc_clear((unsigned)sizeof(struct my_acl));
+    if (p != NULL)
     {
-	p = (struct my_acl *)alloc_clear((unsigned)sizeof(struct my_acl));
-	if (p != NULL)
-	{
 # ifdef FEAT_MBYTE
-	    WCHAR	*wn = NULL;
+	WCHAR	*wn = NULL;
 
-	    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
-		wn = enc_to_utf16(fname, NULL);
-	    if (wn != NULL)
+	if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
+	    wn = enc_to_utf16(fname, NULL);
+	if (wn != NULL)
+	{
+	    /* Try to retrieve the entire security descriptor. */
+	    err = GetNamedSecurityInfoW(
+		    wn,			// Abstract filename
+		    SE_FILE_OBJECT,	// File Object
+		    OWNER_SECURITY_INFORMATION |
+		    GROUP_SECURITY_INFORMATION |
+		    DACL_SECURITY_INFORMATION |
+		    SACL_SECURITY_INFORMATION,
+		    &p->pSidOwner,	// Ownership information.
+		    &p->pSidGroup,	// Group membership.
+		    &p->pDacl,		// Discretionary information.
+		    &p->pSacl,		// For auditing purposes.
+		    &p->pSecurityDescriptor);
+	    if (err == ERROR_ACCESS_DENIED ||
+		    err == ERROR_PRIVILEGE_NOT_HELD)
 	    {
-		/* Try to retrieve the entire security descriptor. */
-		err = pGetNamedSecurityInfoW(
-			    wn,			// Abstract filename
-			    SE_FILE_OBJECT,	// File Object
-			    OWNER_SECURITY_INFORMATION |
-			    GROUP_SECURITY_INFORMATION |
-			    DACL_SECURITY_INFORMATION |
-			    SACL_SECURITY_INFORMATION,
-			    &p->pSidOwner,	// Ownership information.
-			    &p->pSidGroup,	// Group membership.
-			    &p->pDacl,		// Discretionary information.
-			    &p->pSacl,		// For auditing purposes.
-			    &p->pSecurityDescriptor);
-		if (err == ERROR_ACCESS_DENIED ||
-			err == ERROR_PRIVILEGE_NOT_HELD)
-		{
-		    /* Retrieve only DACL. */
-		    (void)pGetNamedSecurityInfoW(
-			    wn,
-			    SE_FILE_OBJECT,
-			    DACL_SECURITY_INFORMATION,
-			    NULL,
-			    NULL,
-			    &p->pDacl,
-			    NULL,
-			    &p->pSecurityDescriptor);
-		}
-		if (p->pSecurityDescriptor == NULL)
-		{
-		    mch_free_acl((vim_acl_T)p);
-		    p = NULL;
-		}
-		vim_free(wn);
+		/* Retrieve only DACL. */
+		(void)GetNamedSecurityInfoW(
+			wn,
+			SE_FILE_OBJECT,
+			DACL_SECURITY_INFORMATION,
+			NULL,
+			NULL,
+			&p->pDacl,
+			NULL,
+			&p->pSecurityDescriptor);
 	    }
-	    else
-# endif
+	    if (p->pSecurityDescriptor == NULL)
 	    {
-		/* Try to retrieve the entire security descriptor. */
-		err = pGetNamedSecurityInfo(
-			    (LPSTR)fname,	// Abstract filename
-			    SE_FILE_OBJECT,	// File Object
-			    OWNER_SECURITY_INFORMATION |
-			    GROUP_SECURITY_INFORMATION |
-			    DACL_SECURITY_INFORMATION |
-			    SACL_SECURITY_INFORMATION,
-			    &p->pSidOwner,	// Ownership information.
-			    &p->pSidGroup,	// Group membership.
-			    &p->pDacl,		// Discretionary information.
-			    &p->pSacl,		// For auditing purposes.
-			    &p->pSecurityDescriptor);
-		if (err == ERROR_ACCESS_DENIED ||
-			err == ERROR_PRIVILEGE_NOT_HELD)
-		{
-		    /* Retrieve only DACL. */
-		    (void)pGetNamedSecurityInfo(
-			    (LPSTR)fname,
-			    SE_FILE_OBJECT,
-			    DACL_SECURITY_INFORMATION,
-			    NULL,
-			    NULL,
-			    &p->pDacl,
-			    NULL,
-			    &p->pSecurityDescriptor);
-		}
-		if (p->pSecurityDescriptor == NULL)
-		{
-		    mch_free_acl((vim_acl_T)p);
-		    p = NULL;
-		}
+		mch_free_acl((vim_acl_T)p);
+		p = NULL;
+	    }
+	    vim_free(wn);
+	}
+	else
+# endif
+	{
+	    /* Try to retrieve the entire security descriptor. */
+	    err = GetNamedSecurityInfo(
+		    (LPSTR)fname,	// Abstract filename
+		    SE_FILE_OBJECT,	// File Object
+		    OWNER_SECURITY_INFORMATION |
+		    GROUP_SECURITY_INFORMATION |
+		    DACL_SECURITY_INFORMATION |
+		    SACL_SECURITY_INFORMATION,
+		    &p->pSidOwner,	// Ownership information.
+		    &p->pSidGroup,	// Group membership.
+		    &p->pDacl,		// Discretionary information.
+		    &p->pSacl,		// For auditing purposes.
+		    &p->pSecurityDescriptor);
+	    if (err == ERROR_ACCESS_DENIED ||
+		    err == ERROR_PRIVILEGE_NOT_HELD)
+	    {
+		/* Retrieve only DACL. */
+		(void)GetNamedSecurityInfo(
+			(LPSTR)fname,
+			SE_FILE_OBJECT,
+			DACL_SECURITY_INFORMATION,
+			NULL,
+			NULL,
+			&p->pDacl,
+			NULL,
+			&p->pSecurityDescriptor);
+	    }
+	    if (p->pSecurityDescriptor == NULL)
+	    {
+		mch_free_acl((vim_acl_T)p);
+		p = NULL;
 	    }
 	}
     }
@@ -3733,7 +3627,7 @@ mch_set_acl(char_u *fname, vim_acl_T acl)
     struct my_acl   *p = (struct my_acl *)acl;
     SECURITY_INFORMATION    sec_info = 0;
 
-    if (p != NULL && advapi_lib != NULL)
+    if (p != NULL)
     {
 # ifdef FEAT_MBYTE
 	WCHAR	*wn = NULL;
@@ -3761,7 +3655,7 @@ mch_set_acl(char_u *fname, vim_acl_T acl)
 	    wn = enc_to_utf16(fname, NULL);
 	if (wn != NULL)
 	{
-	    (void)pSetNamedSecurityInfoW(
+	    (void)SetNamedSecurityInfoW(
 			wn,			// Abstract filename
 			SE_FILE_OBJECT,		// File Object
 			sec_info,
@@ -3775,7 +3669,7 @@ mch_set_acl(char_u *fname, vim_acl_T acl)
 	else
 # endif
 	{
-	    (void)pSetNamedSecurityInfo(
+	    (void)SetNamedSecurityInfo(
 			(LPSTR)fname,		// Abstract filename
 			SE_FILE_OBJECT,		// File Object
 			sec_info,
@@ -4076,7 +3970,7 @@ vim_create_process(
     STARTUPINFO		*si,
     PROCESS_INFORMATION *pi)
 {
-#  ifdef FEAT_MBYTE
+#ifdef FEAT_MBYTE
     if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
     {
 	WCHAR	*wcmd = enc_to_utf16((char_u *)cmd, NULL);
@@ -4114,6 +4008,28 @@ vim_create_process(
 }
 
 
+    static HINSTANCE
+vim_shell_execute(
+    char *cmd,
+    INT	 n_show_cmd)
+{
+#ifdef FEAT_MBYTE
+    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
+    {
+	WCHAR *wcmd = enc_to_utf16((char_u *)cmd, NULL);
+	if (wcmd != NULL)
+	{
+	    HINSTANCE ret;
+	    ret = ShellExecuteW(NULL, NULL, wcmd, NULL, NULL, n_show_cmd);
+	    vim_free(wcmd);
+	    return ret;
+	}
+    }
+#endif
+    return ShellExecute(NULL, NULL, cmd, NULL, NULL, n_show_cmd);
+}
+
+
 #if defined(FEAT_GUI_W32) || defined(PROTO)
 
 /*
@@ -4138,31 +4054,21 @@ mch_system_classic(char *cmd, int options)
     si.lpTitle = NULL;
     si.dwFlags = STARTF_USESHOWWINDOW;
     /*
-     * It's nicer to run a filter command in a minimized window, but in
-     * Windows 95 this makes the command MUCH slower.  We can't do it under
-     * Win32s either as it stops the synchronous spawn workaround working.
+     * It's nicer to run a filter command in a minimized window.
      * Don't activate the window to keep focus on Vim.
      */
-    if ((options & SHELL_DOOUT) && !mch_windows95())
+    if (options & SHELL_DOOUT)
 	si.wShowWindow = SW_SHOWMINNOACTIVE;
     else
 	si.wShowWindow = SW_SHOWNORMAL;
     si.cbReserved2 = 0;
     si.lpReserved2 = NULL;
 
-    /* There is a strange error on Windows 95 when using "c:\command.com".
-     * When the "c:\\" is left out it works OK...? */
-    if (mch_windows95()
-	    && (STRNICMP(cmd, "c:/command.com", 14) == 0
-		|| STRNICMP(cmd, "c:\\command.com", 14) == 0))
-	cmd += 3;
-
     /* Now, run the command */
     vim_create_process(cmd, FALSE,
 	    CREATE_DEFAULT_ERROR_MODE |	CREATE_NEW_CONSOLE, &si, &pi);
 
     /* Wait for the command to terminate before continuing */
-    if (g_PlatformId != VER_PLATFORM_WIN32s)
     {
 #ifdef FEAT_GUI
 	int	    delay = 1;
@@ -4194,23 +4100,6 @@ mch_system_classic(char *cmd, int options)
 
 	/* Get the command exit code */
 	GetExitCodeProcess(pi.hProcess, &ret);
-    }
-    else
-    {
-	/*
-	 * This ugly code is the only quick way of performing
-	 * a synchronous spawn under Win32s. Yuk.
-	 */
-	num_windows = 0;
-	EnumWindows(win32ssynch_cb, 0);
-	old_num_windows = num_windows;
-	do
-	{
-	    Sleep(1000);
-	    num_windows = 0;
-	    EnumWindows(win32ssynch_cb, 0);
-	} while (num_windows == old_num_windows);
-	ret = 0;
     }
 
     /* Close the handles to the subprocess, so that it goes away */
@@ -4453,11 +4342,11 @@ mch_system_piped(char *cmd, int options)
 
     if ( ! CreatePipe(&g_hChildStd_OUT_Rd, &g_hChildStd_OUT_Wr, &saAttr, 0)
 	/* Ensure the read handle to the pipe for STDOUT is not inherited. */
-       || ! pSetHandleInformation(g_hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)
+       || ! SetHandleInformation(g_hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)
 	/* Create a pipe for the child process's STDIN. */
        || ! CreatePipe(&g_hChildStd_IN_Rd, &g_hChildStd_IN_Wr, &saAttr, 0)
 	/* Ensure the write handle to the pipe for STDIN is not inherited. */
-       || ! pSetHandleInformation(g_hChildStd_IN_Wr, HANDLE_FLAG_INHERIT, 0) )
+       || ! SetHandleInformation(g_hChildStd_IN_Wr, HANDLE_FLAG_INHERIT, 0) )
     {
 	CloseHandle(g_hChildStd_IN_Rd);
 	CloseHandle(g_hChildStd_IN_Wr);
@@ -4552,9 +4441,6 @@ mch_system_piped(char *cmd, int options)
 		    /* Get extra characters when we don't have any.  Reset the
 		     * counter and timer. */
 		    noread_cnt = 0;
-# if defined(HAVE_GETTIMEOFDAY) && defined(HAVE_SYS_TIME_H)
-		    gettimeofday(&start_tv, NULL);
-# endif
 		    len = ui_inchar(ta_buf, BUFLEN, 10L, 0);
 		}
 		if (ta_len > 0 || len > 0)
@@ -4707,7 +4593,7 @@ mch_system_piped(char *cmd, int options)
 mch_system(char *cmd, int options)
 {
     /* if we can pipe and the shelltemp option is off */
-    if (allowPiping && !p_stmp)
+    if (!p_stmp)
 	return mch_system_piped(cmd, options);
     else
 	return mch_system_classic(cmd, options);
@@ -4842,11 +4728,12 @@ mch_call_shell(
 	if (*cmdbase == '(')
 	    ++cmdbase;
 
-	if ((STRNICMP(cmdbase, "start", 5) == 0) && vim_iswhite(cmdbase[5]))
+	if ((STRNICMP(cmdbase, "start", 5) == 0) && VIM_ISWHITE(cmdbase[5]))
 	{
 	    STARTUPINFO		si;
 	    PROCESS_INFORMATION	pi;
 	    DWORD		flags = CREATE_NEW_CONSOLE;
+	    INT			n_show_cmd = SW_SHOWNORMAL;
 	    char_u		*p;
 
 	    ZeroMemory(&si, sizeof(si));
@@ -4860,14 +4747,15 @@ mch_call_shell(
 
 	    cmdbase = skipwhite(cmdbase + 5);
 	    if ((STRNICMP(cmdbase, "/min", 4) == 0)
-		    && vim_iswhite(cmdbase[4]))
+		    && VIM_ISWHITE(cmdbase[4]))
 	    {
 		cmdbase = skipwhite(cmdbase + 4);
 		si.dwFlags = STARTF_USESHOWWINDOW;
 		si.wShowWindow = SW_SHOWMINNOACTIVE;
+		n_show_cmd = SW_SHOWMINNOACTIVE;
 	    }
 	    else if ((STRNICMP(cmdbase, "/b", 2) == 0)
-		    && vim_iswhite(cmdbase[2]))
+		    && VIM_ISWHITE(cmdbase[2]))
 	    {
 		cmdbase = skipwhite(cmdbase + 2);
 		flags = CREATE_NO_WINDOW;
@@ -4936,6 +4824,9 @@ mch_call_shell(
 	     */
 	    if (vim_create_process((char *)newcmd, FALSE, flags, &si, &pi))
 		x = 0;
+	    else if (vim_shell_execute((char *)newcmd, n_show_cmd)
+							       > (HINSTANCE)32)
+		x = 0;
 	    else
 	    {
 		x = -1;
@@ -4960,7 +4851,7 @@ mch_call_shell(
 	{
 	    cmdlen = (
 #ifdef FEAT_GUI_W32
-		(allowPiping && !p_stmp ? 0 : STRLEN(vimrun_path)) +
+		(!p_stmp ? 0 : STRLEN(vimrun_path)) +
 #endif
 		STRLEN(p_sh) + STRLEN(p_shcf) + STRLEN(cmd) + 10);
 
@@ -4970,15 +4861,27 @@ mch_call_shell(
 #if defined(FEAT_GUI_W32)
 		if (need_vimrun_warning)
 		{
-		    MessageBox(NULL,
-			    _("VIMRUN.EXE not found in your $PATH.\n"
-				"External commands will not pause after completion.\n"
-				"See  :help win32-vimrun  for more information."),
-			    _("Vim Warning"),
-			    MB_ICONWARNING);
+		    char *msg = _("VIMRUN.EXE not found in your $PATH.\n"
+			"External commands will not pause after completion.\n"
+			"See  :help win32-vimrun  for more information.");
+		    char *title = _("Vim Warning");
+# ifdef FEAT_MBYTE
+		    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
+		    {
+			WCHAR *wmsg = enc_to_utf16((char_u *)msg, NULL);
+			WCHAR *wtitle = enc_to_utf16((char_u *)title, NULL);
+
+			if (wmsg != NULL && wtitle != NULL)
+			    MessageBoxW(NULL, wmsg, wtitle, MB_ICONWARNING);
+			vim_free(wmsg);
+			vim_free(wtitle);
+		    }
+		    else
+# endif
+			MessageBox(NULL, msg, title, MB_ICONWARNING);
 		    need_vimrun_warning = FALSE;
 		}
-		if (!s_dont_use_vimrun && (!allowPiping || p_stmp))
+		if (!s_dont_use_vimrun && p_stmp)
 		    /* Use vimrun to execute the command.  It opens a console
 		     * window, which can be closed without killing Vim. */
 		    vim_snprintf((char *)newcmd, cmdlen, "%s%s%s %s %s",
@@ -5002,8 +4905,7 @@ mch_call_shell(
     /* Print the return value, unless "vimrun" was used. */
     if (x != 0 && !(options & SHELL_SILENT) && !emsg_silent
 #if defined(FEAT_GUI_W32)
-		&& ((options & SHELL_DOOUT) || s_dont_use_vimrun
-						  || (allowPiping && !p_stmp))
+		&& ((options & SHELL_DOOUT) || s_dont_use_vimrun || !p_stmp)
 #endif
 	    )
     {
@@ -5032,36 +4934,32 @@ mch_call_shell(
 #if defined(FEAT_JOB_CHANNEL) || defined(PROTO)
     static HANDLE
 job_io_file_open(
-        char_u *fname,
-        DWORD dwDesiredAccess,
-        DWORD dwShareMode,
-        LPSECURITY_ATTRIBUTES lpSecurityAttributes,
-        DWORD dwCreationDisposition,
-        DWORD dwFlagsAndAttributes)
+	char_u *fname,
+	DWORD dwDesiredAccess,
+	DWORD dwShareMode,
+	LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+	DWORD dwCreationDisposition,
+	DWORD dwFlagsAndAttributes)
 {
     HANDLE h;
 # ifdef FEAT_MBYTE
     WCHAR *wn = NULL;
     if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
     {
-        wn = enc_to_utf16(fname, NULL);
-        if (wn != NULL)
-        {
-            h = CreateFileW(wn, dwDesiredAccess, dwShareMode,
-                     lpSecurityAttributes, dwCreationDisposition,
-                     dwFlagsAndAttributes, NULL);
-            vim_free(wn);
-            if (h == INVALID_HANDLE_VALUE
-                          && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-                wn = NULL;
-        }
+	wn = enc_to_utf16(fname, NULL);
+	if (wn != NULL)
+	{
+	    h = CreateFileW(wn, dwDesiredAccess, dwShareMode,
+		    lpSecurityAttributes, dwCreationDisposition,
+		    dwFlagsAndAttributes, NULL);
+	    vim_free(wn);
+	}
     }
     if (wn == NULL)
 # endif
-
-        h = CreateFile((LPCSTR)fname, dwDesiredAccess, dwShareMode,
-                     lpSecurityAttributes, dwCreationDisposition,
-                     dwFlagsAndAttributes, NULL);
+	h = CreateFile((LPCSTR)fname, dwDesiredAccess, dwShareMode,
+		lpSecurityAttributes, dwCreationDisposition,
+		dwFlagsAndAttributes, NULL);
     return h;
 }
 
@@ -5127,7 +5025,7 @@ mch_start_job(char *cmd, job_T *job, jobopt_T *options)
     }
     else if (!use_null_for_in &&
 	    (!CreatePipe(&ifd[0], &ifd[1], &saAttr, 0)
-	    || !pSetHandleInformation(ifd[1], HANDLE_FLAG_INHERIT, 0)))
+	    || !SetHandleInformation(ifd[1], HANDLE_FLAG_INHERIT, 0)))
 	goto failed;
 
     if (use_file_for_out)
@@ -5145,7 +5043,7 @@ mch_start_job(char *cmd, job_T *job, jobopt_T *options)
     }
     else if (!use_null_for_out &&
 	    (!CreatePipe(&ofd[0], &ofd[1], &saAttr, 0)
-	    || !pSetHandleInformation(ofd[0], HANDLE_FLAG_INHERIT, 0)))
+	    || !SetHandleInformation(ofd[0], HANDLE_FLAG_INHERIT, 0)))
 	goto failed;
 
     if (use_file_for_err)
@@ -5163,7 +5061,7 @@ mch_start_job(char *cmd, job_T *job, jobopt_T *options)
     }
     else if (!use_out_for_err && !use_null_for_err &&
 	    (!CreatePipe(&efd[0], &efd[1], &saAttr, 0)
-	    || !pSetHandleInformation(efd[0], HANDLE_FLAG_INHERIT, 0)))
+	    || !SetHandleInformation(efd[0], HANDLE_FLAG_INHERIT, 0)))
 	goto failed;
 
     si.dwFlags |= STARTF_USESTDHANDLES;
@@ -5247,13 +5145,95 @@ mch_job_status(job_T *job)
     if (!GetExitCodeProcess(job->jv_proc_info.hProcess, &dwExitCode)
 	    || dwExitCode != STILL_ACTIVE)
     {
-	job->jv_status = JOB_ENDED;
 	job->jv_exitval = (int)dwExitCode;
+	if (job->jv_status < JOB_ENDED)
+	{
+	    ch_log(job->jv_channel, "Job ended");
+	    job->jv_status = JOB_ENDED;
+	}
 	return "dead";
     }
     return "run";
 }
 
+    job_T *
+mch_detect_ended_job(job_T *job_list)
+{
+    HANDLE jobHandles[MAXIMUM_WAIT_OBJECTS];
+    job_T *jobArray[MAXIMUM_WAIT_OBJECTS];
+    job_T *job = job_list;
+
+    while (job != NULL)
+    {
+	DWORD n;
+	DWORD result;
+
+	for (n = 0; n < MAXIMUM_WAIT_OBJECTS
+				       && job != NULL; job = job->jv_next)
+	{
+	    if (job->jv_status == JOB_STARTED)
+	    {
+		jobHandles[n] = job->jv_proc_info.hProcess;
+		jobArray[n] = job;
+		++n;
+	    }
+	}
+	if (n == 0)
+	    continue;
+	result = WaitForMultipleObjects(n, jobHandles, FALSE, 0);
+	if (result >= WAIT_OBJECT_0 && result < WAIT_OBJECT_0 + n)
+	{
+	    job_T *wait_job = jobArray[result - WAIT_OBJECT_0];
+
+	    if (STRCMP(mch_job_status(wait_job), "dead") == 0)
+		return wait_job;
+	}
+    }
+    return NULL;
+}
+
+    static BOOL
+terminate_all(HANDLE process, int code)
+{
+    PROCESSENTRY32  pe;
+    HANDLE	    h = INVALID_HANDLE_VALUE;
+    DWORD	    pid = GetProcessId(process);
+
+    if (pid != 0)
+    {
+	h = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+	if (h != INVALID_HANDLE_VALUE)
+	{
+	    pe.dwSize = sizeof(PROCESSENTRY32);
+	    if (!Process32First(h, &pe))
+		goto theend;
+
+	    do
+	    {
+		if (pe.th32ParentProcessID == pid)
+		{
+		    HANDLE ph = OpenProcess(
+				  PROCESS_ALL_ACCESS, FALSE, pe.th32ProcessID);
+		    if (ph != NULL)
+		    {
+			terminate_all(ph, code);
+			CloseHandle(ph);
+		    }
+		}
+	    } while (Process32Next(h, &pe));
+
+	    CloseHandle(h);
+	}
+    }
+
+theend:
+    return TerminateProcess(process, code);
+}
+
+/*
+ * Send a (deadly) signal to "job".
+ * Return FAIL if it didn't work.
+ */
     int
 mch_stop_job(job_T *job, char_u *how)
 {
@@ -5261,10 +5241,10 @@ mch_stop_job(job_T *job, char_u *how)
 
     if (STRCMP(how, "term") == 0 || STRCMP(how, "kill") == 0 || *how == NUL)
     {
+	/* deadly signal */
 	if (job->jv_job_object != NULL)
 	    return TerminateJobObject(job->jv_job_object, 0) ? OK : FAIL;
-	else
-	    return TerminateProcess(job->jv_proc_info.hProcess, 0) ? OK : FAIL;
+	return terminate_all(job->jv_proc_info.hProcess, 0) ? OK : FAIL;
     }
 
     if (!AttachConsole(job->jv_proc_info.dwProcessId))
@@ -5410,11 +5390,10 @@ termcap_mode_end(void)
 
 
 #ifdef FEAT_GUI_W32
-/*ARGSUSED*/
     void
 mch_write(
-    char_u  *s,
-    int	    len)
+    char_u  *s UNUSED,
+    int	    len UNUSED)
 {
     /* never used */
 }
@@ -5789,7 +5768,7 @@ write_chars(
 	{
 	    char_u *p = pchBuf;
 	    for (n = 0; n < cchwritten; n++)
-		mb_cptr_adv(p);
+		MB_CPTR_ADV(p);
 	    written = p - pchBuf;
 	    g_coord.X += (SHORT)mb_string2cells(pchBuf, written);
 	}
@@ -6112,11 +6091,10 @@ mch_write(
 /*
  * Delay for "msec" milliseconds.
  */
-/*ARGSUSED*/
     void
 mch_delay(
     long    msec,
-    int	    ignoreinput)
+    int	    ignoreinput UNUSED)
 {
 #ifdef FEAT_GUI_W32
     Sleep((int)msec);	    /* never wait for input */
@@ -6176,9 +6154,7 @@ mch_remove(char_u *name)
 	{
 	    n = DeleteFileW(wn) ? 0 : -1;
 	    vim_free(wn);
-	    if (n == 0 || GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-		return n;
-	    /* Retry with non-wide function (for Windows 98). */
+	    return n;
 	}
     }
 #endif
@@ -6187,10 +6163,10 @@ mch_remove(char_u *name)
 
 
 /*
- * check for an "interrupt signal": CTRL-break or CTRL-C
+ * Check for an "interrupt signal": CTRL-break or CTRL-C.
  */
     void
-mch_breakcheck(void)
+mch_breakcheck(int force)
 {
 #ifndef FEAT_GUI_W32	    /* never used */
     if (g_fCtrlCPressed || g_fCBrkPressed)
@@ -6203,63 +6179,32 @@ mch_breakcheck(void)
 
 /* physical RAM to leave for the OS */
 #define WINNT_RESERVE_BYTES     (256*1024*1024)
-#define WIN95_RESERVE_BYTES       (8*1024*1024)
 
 /*
  * How much main memory in KiB that can be used by VIM.
  */
-/*ARGSUSED*/
     long_u
-mch_total_mem(int special)
+mch_total_mem(int special UNUSED)
 {
+    MEMORYSTATUSEX  ms;
+
     PlatformId();
-#if (defined(_MSC_VER) && (WINVER > 0x0400)) || defined(MEMORYSTATUSEX)
-    if (g_PlatformId == VER_PLATFORM_WIN32_NT)
+    /* Need to use GlobalMemoryStatusEx() when there is more memory than
+     * what fits in 32 bits. But it's not always available. */
+    ms.dwLength = sizeof(MEMORYSTATUSEX);
+    GlobalMemoryStatusEx(&ms);
+    if (ms.ullAvailVirtual < ms.ullTotalPhys)
     {
-	MEMORYSTATUSEX  ms;
-
-	/* Need to use GlobalMemoryStatusEx() when there is more memory than
-	 * what fits in 32 bits. But it's not always available. */
-	ms.dwLength = sizeof(MEMORYSTATUSEX);
-	GlobalMemoryStatusEx(&ms);
-	if (ms.ullAvailVirtual < ms.ullTotalPhys)
-	{
-	    /* Process address space fits in physical RAM, use all of it. */
-	    return (long_u)(ms.ullAvailVirtual / 1024);
-	}
-	if (ms.ullTotalPhys <= WINNT_RESERVE_BYTES)
-	{
-	    /* Catch old NT box or perverse hardware setup. */
-	    return (long_u)((ms.ullTotalPhys / 2) / 1024);
-	}
-	/* Use physical RAM less reserve for OS + data. */
-	return (long_u)((ms.ullTotalPhys - WINNT_RESERVE_BYTES) / 1024);
+	/* Process address space fits in physical RAM, use all of it. */
+	return (long_u)(ms.ullAvailVirtual / 1024);
     }
-    else
-#endif
+    if (ms.ullTotalPhys <= WINNT_RESERVE_BYTES)
     {
-	/* Pre-XP or 95 OS handling. */
-	MEMORYSTATUS    ms;
-	long_u		os_reserve_bytes;
-
-	ms.dwLength = sizeof(MEMORYSTATUS);
-	GlobalMemoryStatus(&ms);
-	if (ms.dwAvailVirtual < ms.dwTotalPhys)
-	{
-	    /* Process address space fits in physical RAM, use all of it. */
-	    return (long_u)(ms.dwAvailVirtual / 1024);
-	}
-	os_reserve_bytes = (g_PlatformId == VER_PLATFORM_WIN32_NT)
-	    ? WINNT_RESERVE_BYTES
-	    : WIN95_RESERVE_BYTES;
-	if (ms.dwTotalPhys <= os_reserve_bytes)
-	{
-	    /* Catch old boxes or perverse hardware setup. */
-	    return (long_u)((ms.dwTotalPhys / 2) / 1024);
-	}
-	/* Use physical RAM less reserve for OS + data. */
-	return (long_u)((ms.dwTotalPhys - os_reserve_bytes) / 1024);
+	/* Catch old NT box or perverse hardware setup. */
+	return (long_u)((ms.ullTotalPhys / 2) / 1024);
     }
+    /* Use physical RAM less reserve for OS + data. */
+    return (long_u)((ms.ullTotalPhys - WINNT_RESERVE_BYTES) / 1024);
 }
 
 #ifdef FEAT_MBYTE
@@ -6276,16 +6221,13 @@ mch_wrename(WCHAR *wold, WCHAR *wnew)
     WCHAR	szNewPath[_MAX_PATH + 1];
     HANDLE	hf;
 
-    if (!mch_windows95())
-    {
-	p = wold;
-	for (i = 0; wold[i] != NUL; ++i)
-	    if ((wold[i] == '/' || wold[i] == '\\' || wold[i] == ':')
-		    && wold[i + 1] != 0)
-		p = wold + i + 1;
-	if ((int)(wold + i - p) < 8 || p[6] != '~')
-	    return (MoveFileW(wold, wnew) == 0);
-    }
+    p = wold;
+    for (i = 0; wold[i] != NUL; ++i)
+	if ((wold[i] == '/' || wold[i] == '\\' || wold[i] == ':')
+		&& wold[i + 1] != 0)
+	    p = wold + i + 1;
+    if ((int)(wold + i - p) < 8 || p[6] != '~')
+	return (MoveFileW(wold, wnew) == 0);
 
     if (GetFullPathNameW(wnew, _MAX_PATH, szNewPath, &p) == 0 || p == NULL)
 	return -1;
@@ -6363,22 +6305,17 @@ mch_rename(
 	    retval = mch_wrename(wold, wnew);
 	vim_free(wold);
 	vim_free(wnew);
-	if (retval == 0 || GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-	    return retval;
-	/* Retry with non-wide function (for Windows 98). */
+	return retval;
     }
 #endif
 
     /*
-     * No need to play tricks if not running Windows 95, unless the file name
-     * contains a "~" as the seventh character.
+     * No need to play tricks unless the file name contains a "~" as the
+     * seventh character.
      */
-    if (!mch_windows95())
-    {
-	pszFilePart = (char *)gettail((char_u *)pszOldFile);
-	if (STRLEN(pszFilePart) < 8 || pszFilePart[6] != '~')
-	    return rename(pszOldFile, pszNewFile);
-    }
+    pszFilePart = (char *)gettail((char_u *)pszOldFile);
+    if (STRLEN(pszFilePart) < 8 || pszFilePart[6] != '~')
+	return rename(pszOldFile, pszNewFile);
 
     /* Get base path of new file name.  Undocumented feature: If pszNewFile is
      * a directory, no error is returned and pszFilePart will be NULL. */
@@ -6441,16 +6378,9 @@ mch_rename(
     char *
 default_shell(void)
 {
-    char* psz = NULL;
-
     PlatformId();
 
-    if (g_PlatformId == VER_PLATFORM_WIN32_NT)		/* Windows NT */
-	psz = "cmd.exe";
-    else if (g_PlatformId == VER_PLATFORM_WIN32_WINDOWS) /* Windows 95 */
-	psz = "command.com";
-
-    return psz;
+    return "cmd.exe";
 }
 
 /*
@@ -6496,18 +6426,11 @@ mch_access(char *n, int p)
 
 		hFile = FindFirstFileW(TempNameW, &d);
 		if (hFile == INVALID_HANDLE_VALUE)
-		{
-		    if (GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-			goto getout;
-
-		    /* Retry with non-wide function (for Windows 98). */
-		    vim_free(wn);
-		    wn = NULL;
-		}
+		    goto getout;
 		else
 		    (void)FindClose(hFile);
 	    }
-	    if (wn == NULL)
+	    else
 #endif
 	    {
 		char		    *pch;
@@ -6537,18 +6460,11 @@ mch_access(char *n, int p)
 	    if (wn != NULL)
 	    {
 		if (!GetTempFileNameW(wn, L"VIM", 0, TempNameW))
-		{
-		    if (GetLastError() != ERROR_CALL_NOT_IMPLEMENTED)
-			goto getout;
-
-		    /* Retry with non-wide function (for Windows 98). */
-		    vim_free(wn);
-		    wn = NULL;
-		}
+		    goto getout;
 		else
 		    DeleteFileW(TempNameW);
 	    }
-	    if (wn == NULL)
+	    else
 #endif
 	    {
 		if (!GetTempFileName(n, "VIM", 0, TempName))
@@ -6565,17 +6481,8 @@ mch_access(char *n, int p)
 		| ((p & R_OK) ? GENERIC_READ : 0);
 #ifdef FEAT_MBYTE
 	if (wn != NULL)
-	{
 	    hFile = CreateFileW(wn, am, 0, NULL, OPEN_EXISTING, 0, NULL);
-	    if (hFile == INVALID_HANDLE_VALUE
-			      && GetLastError() == ERROR_CALL_NOT_IMPLEMENTED)
-	    {
-		/* Retry with non-wide function (for Windows 98). */
-		vim_free(wn);
-		wn = NULL;
-	    }
-	}
-	if (wn == NULL)
+	else
 #endif
 	    hFile = CreateFile(n, am, 0, NULL, OPEN_EXISTING, 0, NULL);
 	if (hFile == INVALID_HANDLE_VALUE)
@@ -6610,11 +6517,7 @@ mch_open(char *name, int flags, int mode)
 	{
 	    f = _wopen(wn, flags, mode);
 	    vim_free(wn);
-	    if (f >= 0 || g_PlatformId == VER_PLATFORM_WIN32_NT)
-		return f;
-	    /* Retry with non-wide function (for Windows 98). Can't use
-	     * GetLastError() here and it's unclear what errno gets set to if
-	     * the _wopen() fails for missing wide functions. */
+	    return f;
 	}
     }
 # endif
@@ -6638,12 +6541,7 @@ mch_fopen(char *name, char *mode)
     WCHAR	*wn, *wm;
     FILE	*f = NULL;
 
-    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage
-# ifdef __BORLANDC__
-	    /* Wide functions of Borland C 5.5 do not work on Windows 98. */
-	    && g_PlatformId == VER_PLATFORM_WIN32_NT
-# endif
-       )
+    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
     {
 # if defined(DEBUG) && _MSC_VER >= 1400
 	/* Work around an annoying assertion in the Microsoft debug CRT
@@ -6667,12 +6565,7 @@ mch_fopen(char *name, char *mode)
 # if defined(DEBUG) && _MSC_VER >= 1400
 	_set_fmode(oldMode);
 # endif
-
-	if (f != NULL || g_PlatformId == VER_PLATFORM_WIN32_NT)
-	    return f;
-	/* Retry with non-wide function (for Windows 98). Can't use
-	 * GetLastError() here and it's unclear what errno gets set to if
-	 * the _wfopen() fails for missing wide functions. */
+	return f;
     }
 
     /* fopen() can open a file which name is longer than _MAX_PATH bytes
@@ -6843,8 +6736,7 @@ mch_copy_file_attribute(char_u *from, char_u *to)
 #ifdef FEAT_MBYTE
     /* File streams only work on Windows NT and later. */
     PlatformId();
-    if (g_PlatformId == VER_PLATFORM_WIN32_NT)
-	copy_infostreams(from, to);
+    copy_infostreams(from, to);
 #endif
     return 0;
 }
@@ -6856,7 +6748,6 @@ mch_copy_file_attribute(char_u *from, char_u *to)
  */
 
 /* These magic numbers are from the MS header files */
-#define MIN_STACK_WIN9X 17
 #define MIN_STACK_WINNT 2
 
 /*
@@ -6876,10 +6767,7 @@ myresetstkoflw(void)
     DWORD	nPageSize;
     DWORD	dummy;
 
-    /* This code will not work on win32s. */
     PlatformId();
-    if (g_PlatformId == VER_PLATFORM_WIN32s)
-	return 0;
 
     /* We need to know the system page size. */
     GetSystemInfo(&si);
@@ -6895,29 +6783,12 @@ myresetstkoflw(void)
 
     /* ...and the page thats min_stack_req pages away from stack base; this is
      * the lowest page we could use. */
-    pLowestPossiblePage = pStackBase + ((g_PlatformId == VER_PLATFORM_WIN32_NT)
-			     ? MIN_STACK_WINNT : MIN_STACK_WIN9X) * nPageSize;
+    pLowestPossiblePage = pStackBase + MIN_STACK_WINNT * nPageSize;
 
-    /* On Win95, we want the next page down from the end of the stack. */
-    if (g_PlatformId == VER_PLATFORM_WIN32_WINDOWS)
     {
-	/* Find the page that's only 1 page down from the page that the stack
-	 * ptr is in. */
-	pGuardPage = (BYTE*)((DWORD)nPageSize * (((DWORD)pStackPtr
-						    / (DWORD)nPageSize) - 1));
-	if (pGuardPage < pLowestPossiblePage)
-	    return 0;
-
-	/* Apply the noaccess attribute to the page -- there's no guard
-	 * attribute in win95-type OSes. */
-	if (!VirtualProtect(pGuardPage, nPageSize, PAGE_NOACCESS, &dummy))
-	    return 0;
-    }
-    else
-    {
-	/* On NT, however, we want the first committed page in the stack Start
-	 * at the stack base and move forward through memory until we find a
-	 * committed block. */
+	/* We want the first committed page in the stack Start at the stack
+	 * base and move forward through memory until we find a committed block.
+	 */
 	BYTE *pBlock = pStackBase;
 
 	for (;;)
@@ -7168,3 +7039,43 @@ fix_arg_enc(void)
     set_alist_count();
 }
 #endif
+
+    int
+mch_setenv(char *var, char *value, int x)
+{
+    char_u	*envbuf;
+
+    envbuf = alloc((unsigned)(STRLEN(var) + STRLEN(value) + 2));
+    if (envbuf == NULL)
+	return -1;
+
+    sprintf((char *)envbuf, "%s=%s", var, value);
+
+#ifdef FEAT_MBYTE
+    if (enc_codepage >= 0 && (int)GetACP() != enc_codepage)
+    {
+	WCHAR	    *p = enc_to_utf16(envbuf, NULL);
+
+	vim_free(envbuf);
+	if (p == NULL)
+	    return -1;
+	_wputenv(p);
+# ifdef libintl_wputenv
+	libintl_wputenv(p);
+# endif
+	/* Unlike Un*x systems, we can free the string for _wputenv(). */
+	vim_free(p);
+    }
+    else
+#endif
+    {
+	_putenv((char *)envbuf);
+# ifdef libintl_putenv
+	libintl_putenv((char *)envbuf);
+# endif
+	/* Unlike Un*x systems, we can free the string for _putenv(). */
+	vim_free(envbuf);
+    }
+
+    return 0;
+}

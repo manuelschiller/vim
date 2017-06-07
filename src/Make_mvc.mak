@@ -1,7 +1,7 @@
-# Makefile for Vim on Win32 (Windows NT/2000/XP/2003 and Windows 95/98/Me)
-# and Win64, using the Microsoft Visual C++ compilers. Known to work with
-# VC5, VC6 (VS98), VC7.0 (VS2002), VC7.1 (VS2003), VC8 (VS2005),
-# VC9 (VS2008), VC10 (VS2010) and VC11 (VS2012)
+# Makefile for Vim on Win32 (Windows XP/2003/Vista/7/8/10) and Win64,
+# using the Microsoft Visual C++ compilers. Known to work with VC5, VC6 (VS98),
+# VC7.0 (VS2002), VC7.1 (VS2003), VC8 (VS2005), VC9 (VS2008), VC10 (VS2010),
+# VC11 (VS2012), VC12 (VS2013) and VC14 (VS2015)
 #
 # To build using other Windows compilers, see INSTALLpc.txt
 #
@@ -119,7 +119,7 @@
 #	  yes:   Write a normal mapfile.
 #	  lines: Write a mapfile with line numbers (only for VC6 and later)
 #
-#	Static Code Analysis: ANALYZE=yes (works with VS2012 only)
+#	Static Code Analysis: ANALYZE=yes (works with VS2012 or later)
 #
 # You can combine any of these interfaces
 #
@@ -162,9 +162,9 @@
 # you can set DEFINES on the command line, e.g.,
 #	nmake -f Make_mvc.mvc "DEFINES=-DEMACS_TAGS"
 
-# Build on both Windows NT/XP and Windows 9x
+# Build on Windows NT/XP
 
-TARGETOS = BOTH
+TARGETOS = WINNT
 
 # Select one of eight object code directories, depends on GUI, OLE, DEBUG and
 # interfaces.
@@ -285,8 +285,10 @@ MSVCRT_VER = ($(MSVCVER) / 10 - 50)
 # Base name of the msvcrXX.dll
 !if $(MSVCRT_VER) <= 60
 MSVCRT_NAME = msvcrt
-!else
+!elseif $(MSVCRT_VER) <= 130
 MSVCRT_NAME = msvcr$(MSVCRT_VER)
+!else
+MSVCRT_NAME = vcruntime$(MSVCRT_VER)
 !endif
 
 !if $(MSVC_MAJOR) == 6
@@ -296,6 +298,9 @@ CPU = ix86
 
 # Flag to turn on Win64 compatibility warnings for VC7.x and VC8.
 WP64CHECK = /Wp64
+
+# Use multiprocess build
+USE_MP = yes
 
 #>>>>> path of the compiler and linker; name of include and lib directories
 # PATH = c:\msvc20\bin;$(PATH)
@@ -436,13 +441,7 @@ CFLAGS = -c /W3 /nologo $(CVARS) -I. -Iproto -DHAVE_PATHDEF -DWIN32 \
 #>>>>> end of choices
 ###########################################################################
 
-!ifdef OS
-OS_TYPE	= winnt
 DEL_TREE = rmdir /s /q
-!else
-OS_TYPE	= win95
-DEL_TREE = deltree /y
-!endif
 
 INTDIR=$(OBJDIR)
 OUTDIR=$(OBJDIR)
@@ -478,6 +477,14 @@ NODEFAULTLIB =
 !else
 NODEFAULTLIB = /nodefaultlib
 !endif
+
+# Use multiprocess build on MSVC 10
+!if "$(USE_MP)"=="yes"
+!if $(MSVC_MAJOR) >= 10
+CFLAGS = $(CFLAGS) /MP
+!endif
+!endif
+
 
 !ifdef NODEBUG
 VIM = vim
@@ -1114,9 +1121,6 @@ clean:
 	cd ..
 	cd tee
 	$(MAKE) /NOLOGO -f Make_mvc.mak clean
-	cd ..
-	cd GvimExt
-	$(MAKE) /NOLOGO -f Makefile clean
 	cd ..
 	cd GvimExt
 	$(MAKE) /NOLOGO -f Makefile clean

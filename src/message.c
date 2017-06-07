@@ -42,6 +42,9 @@ static int	confirm_msg_used = FALSE;	/* displaying confirm_msg */
 static char_u	*confirm_msg = NULL;		/* ":confirm" message */
 static char_u	*confirm_msg_tail;		/* tail of confirm_msg */
 #endif
+#ifdef FEAT_JOB_CHANNEL
+static int emsg_to_channel_log = FALSE;
+#endif
 
 struct msg_hist
 {
@@ -165,6 +168,14 @@ msg_attr_keep(
 		&& last_msg_hist->msg != NULL
 		&& STRCMP(s, last_msg_hist->msg)))
 	add_msg_hist(s, -1, attr);
+
+#ifdef FEAT_JOB_CHANNEL
+    if (emsg_to_channel_log)
+    {
+	/* Write message in the channel log. */
+	ch_logs(NULL, "ERROR: %s", (char *)s);
+    }
+#endif
 
     /* When displaying keep_msg, don't let msg_start() free it, caller must do
      * that. */
@@ -304,7 +315,7 @@ trunc_string(
 	for (;;)
 	{
 	    do
-		half = half - (*mb_head_off)(s, s + half - 1) - 1;
+		half = half - utf_head_off(s, s + half - 1) - 1;
 	    while (half > 0 && utf_iscomposing(utf_ptr2char(s + half)));
 	    n = ptr2cells(s + half);
 	    if (len + n > room || half == 0)
@@ -492,7 +503,7 @@ msg_source(int attr)
     p = get_emsg_lnum();
     if (p != NULL)
     {
-	msg_attr(p, hl_attr(HLF_N));
+	msg_attr(p, HL_ATTR(HLF_N));
 	vim_free(p);
 	last_sourcing_lnum = sourcing_lnum;  /* only once for each line */
     }
@@ -528,6 +539,31 @@ emsg_not_now(void)
     return FALSE;
 }
 
+#if defined(FEAT_EVAL) || defined(PROTO)
+static garray_T ignore_error_list = GA_EMPTY;
+
+    void
+ignore_error_for_testing(char_u *error)
+{
+    if (ignore_error_list.ga_itemsize == 0)
+	ga_init2(&ignore_error_list, sizeof(char_u *), 1);
+
+    ga_add_string(&ignore_error_list, error);
+}
+
+    static int
+ignore_error(char_u *msg)
+{
+    int i;
+
+    for (i = 0; i < ignore_error_list.ga_len; ++i)
+	if (strstr((char *)msg,
+		  (char *)((char_u **)(ignore_error_list.ga_data))[i]) != NULL)
+	    return TRUE;
+    return FALSE;
+}
+#endif
+
 #if !defined(HAVE_STRERROR) || defined(PROTO)
 /*
  * Replacement for perror() that behaves more or less like emsg() was called.
@@ -556,6 +592,7 @@ emsg(char_u *s)
 {
     int		attr;
     char_u	*p;
+    int		r;
 #ifdef FEAT_EVAL
     int		ignore = FALSE;
     int		severe;
@@ -565,9 +602,14 @@ emsg(char_u *s)
     if (emsg_not_now())
 	return TRUE;
 
+#ifdef FEAT_EVAL
+    /* When testing some errors are turned into a normal message. */
+    if (ignore_error(s))
+	/* don't call msg() if it results in a dialog */
+	return msg_use_printf() ? FALSE : msg(s);
+#endif
+
     called_emsg = TRUE;
-    if (emsg_silent == 0)
-	ex_exitval = 1;
 
     /*
      * If "emsg_severe" is TRUE: When an error exception is to be thrown,
@@ -624,8 +666,13 @@ emsg(char_u *s)
 		}
 		redir_write(s, -1);
 	    }
+#ifdef FEAT_JOB_CHANNEL
+	    ch_logs(NULL, "ERROR: %s", (char *)s);
+#endif
 	    return TRUE;
 	}
+
+	ex_exitval = 1;
 
 	/* Reset msg_silent, an error causes messages to be switched back on. */
 	msg_silent = 0;
@@ -643,13 +690,16 @@ emsg(char_u *s)
 
     emsg_on_display = TRUE;	/* remember there is an error message */
     ++msg_scroll;		/* don't overwrite a previous message */
-    attr = hl_attr(HLF_E);	/* set highlight mode for error messages */
+    attr = HL_ATTR(HLF_E);	/* set highlight mode for error messages */
     if (msg_scrolled != 0)
 	need_wait_return = TRUE;    /* needed in case emsg() is called after
 				     * wait_return has reset need_wait_return
 				     * and a redraw is expected because
 				     * msg_scrolled is non-zero */
 
+#ifdef FEAT_JOB_CHANNEL
+    emsg_to_channel_log = TRUE;
+#endif
     /*
      * Display name and line number for the source of the error.
      */
@@ -659,8 +709,14 @@ emsg(char_u *s)
      * Display the error message itself.
      */
     msg_nowait = FALSE;			/* wait for this msg */
-    return msg_attr(s, attr);
+    r = msg_attr(s, attr);
+
+#ifdef FEAT_JOB_CHANNEL
+    emsg_to_channel_log = FALSE;
+#endif
+    return r;
 }
+
 
 /*
  * Print an error message with one "%s" and one string argument.
@@ -669,6 +725,84 @@ emsg(char_u *s)
 emsg2(char_u *s, char_u *a1)
 {
     return emsg3(s, a1, NULL);
+}
+
+/*
+ * Print an error message with one or two "%s" and one or two string arguments.
+ * This is not in message.c to avoid a warning for prototypes.
+ */
+    int
+emsg3(char_u *s, char_u *a1, char_u *a2)
+{
+    if (emsg_not_now())
+	return TRUE;		/* no error messages at the moment */
+    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, a1, a2);
+    return emsg(IObuff);
+}
+
+/*
+ * Print an error message with one "%ld" and one long int argument.
+ * This is not in message.c to avoid a warning for prototypes.
+ */
+    int
+emsgn(char_u *s, long n)
+{
+    if (emsg_not_now())
+	return TRUE;		/* no error messages at the moment */
+    vim_snprintf((char *)IObuff, IOSIZE, (char *)s, n);
+    return emsg(IObuff);
+}
+
+/*
+ * Same as emsg(...), but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsg(char_u *s)
+{
+    msg(s);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+
+/*
+ * Same as emsg2(...) but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsg2(char_u *s, char_u *a1)
+{
+    emsg2(s, a1);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+/*
+ * Same as emsgn(...) but abort on error when ABORT_ON_INTERNAL_ERROR is
+ * defined. It is used for internal errors only, so that they can be
+ * detected when fuzzing vim.
+ */
+    void
+iemsgn(char_u *s, long n)
+{
+    emsgn(s, n);
+#ifdef ABORT_ON_INTERNAL_ERROR
+    abort();
+#endif
+}
+
+/*
+ * Give an "Internal error" message.
+ */
+    void
+internal_error(char *where)
+{
+    IEMSG2(_(e_intern2), where);
 }
 
 /* emsg3() and emsgn() are in misc2.c to avoid warnings for the prototypes. */
@@ -851,7 +985,7 @@ ex_messages(exarg_T *eap)
 	if (s != NULL && *s != NUL)
 	    msg_attr((char_u *)
 		    _("Messages maintainer: Bram Moolenaar <Bram@vim.org>"),
-		    hl_attr(HLF_T));
+		    HL_ATTR(HLF_T));
     }
 
     /* Display what was not skipped. */
@@ -1146,7 +1280,7 @@ hit_return_msg(void)
     if (got_int)
 	MSG_PUTS(_("Interrupt: "));
 
-    MSG_PUTS_ATTR(_("Press ENTER or type command to continue"), hl_attr(HLF_R));
+    MSG_PUTS_ATTR(_("Press ENTER or type command to continue"), HL_ATTR(HLF_R));
     if (!msg_use_printf())
 	msg_clr_eos();
     p_more = save_p_more;
@@ -1297,7 +1431,7 @@ msg_home_replace(char_u *fname)
     void
 msg_home_replace_hl(char_u *fname)
 {
-    msg_home_replace_attr(fname, hl_attr(HLF_D));
+    msg_home_replace_attr(fname, HL_ATTR(HLF_D));
 }
 #endif
 
@@ -1410,7 +1544,7 @@ msg_outtrans_len_attr(char_u *msgstr, int len, int attr)
 		    msg_puts_attr_len(plain_start, (int)(str - plain_start),
 									attr);
 		plain_start = str + mb_l;
-		msg_puts_attr(transchar(c), attr == 0 ? hl_attr(HLF_8) : attr);
+		msg_puts_attr(transchar(c), attr == 0 ? HL_ATTR(HLF_8) : attr);
 		retval += char2cells(c);
 	    }
 	    len -= mb_l - 1;
@@ -1428,7 +1562,7 @@ msg_outtrans_len_attr(char_u *msgstr, int len, int attr)
 		    msg_puts_attr_len(plain_start, (int)(str - plain_start),
 									attr);
 		plain_start = str + 1;
-		msg_puts_attr(s, attr == 0 ? hl_attr(HLF_8) : attr);
+		msg_puts_attr(s, attr == 0 ? HL_ATTR(HLF_8) : attr);
 		retval += (int)STRLEN(s);
 	    }
 	    else
@@ -1489,7 +1623,7 @@ msg_outtrans_special(
     int		attr;
     int		len;
 
-    attr = hl_attr(HLF_8);
+    attr = HL_ATTR(HLF_8);
     while (*str != NUL)
     {
 	/* Leading and trailing spaces need to be displayed in <> form. */
@@ -1655,7 +1789,7 @@ msg_prt_line(char_u *s, int list)
     if (list && lcs_trail)
     {
 	trail = s + STRLEN(s);
-	while (trail > s && vim_iswhite(trail[-1]))
+	while (trail > s && VIM_ISWHITE(trail[-1]))
 	    --trail;
     }
 
@@ -1712,13 +1846,13 @@ msg_prt_line(char_u *s, int list)
 		{
 		    c = lcs_tab1;
 		    c_extra = lcs_tab2;
-		    attr = hl_attr(HLF_8);
+		    attr = HL_ATTR(HLF_8);
 		}
 	    }
 	    else if (c == 160 && list && lcs_nbsp != NUL)
 	    {
 		c = lcs_nbsp;
-		attr = hl_attr(HLF_8);
+		attr = HL_ATTR(HLF_8);
 	    }
 	    else if (c == NUL && list && lcs_eol != NUL)
 	    {
@@ -1726,7 +1860,7 @@ msg_prt_line(char_u *s, int list)
 		c_extra = NUL;
 		n_extra = 1;
 		c = lcs_eol;
-		attr = hl_attr(HLF_AT);
+		attr = HL_ATTR(HLF_AT);
 		--s;
 	    }
 	    else if (c != NUL && (n = byte2cells(c)) > 1)
@@ -1737,17 +1871,17 @@ msg_prt_line(char_u *s, int list)
 		c = *p_extra++;
 		/* Use special coloring to be able to distinguish <hex> from
 		 * the same in plain text. */
-		attr = hl_attr(HLF_8);
+		attr = HL_ATTR(HLF_8);
 	    }
 	    else if (c == ' ' && trail != NULL && s > trail)
 	    {
 		c = lcs_trail;
-		attr = hl_attr(HLF_8);
+		attr = HL_ATTR(HLF_8);
 	    }
 	    else if (c == ' ' && list && lcs_space != NUL)
 	    {
 		c = lcs_space;
-		attr = hl_attr(HLF_8);
+		attr = HL_ATTR(HLF_8);
 	    }
 	}
 
@@ -1779,7 +1913,7 @@ screen_puts_mbyte(char_u *s, int l, int attr)
 		msg_col == Columns - 1))
     {
 	/* Doesn't fit, print a highlighted '>' to fill it up. */
-	msg_screen_putchar('>', hl_attr(HLF_AT));
+	msg_screen_putchar('>', HL_ATTR(HLF_AT));
 	return s;
     }
 
@@ -1822,7 +1956,7 @@ msg_puts(char_u *s)
 msg_puts_title(
     char_u	*s)
 {
-    msg_puts_attr(s, hl_attr(HLF_T));
+    msg_puts_attr(s, HL_ATTR(HLF_T));
 }
 
 /*
@@ -1847,7 +1981,7 @@ msg_puts_long_len_attr(char_u *longstr, int len, int attr)
     {
 	slen = (room - 3) / 2;
 	msg_outtrans_len_attr(longstr, slen, attr);
-	msg_puts_attr((char_u *)"...", hl_attr(HLF_8));
+	msg_puts_attr((char_u *)"...", HL_ATTR(HLF_8));
     }
     msg_outtrans_len_attr(longstr + len - slen, slen, attr);
 }
@@ -2012,8 +2146,6 @@ msg_puts_display(
 
 	    inc_msg_scrolled();
 	    need_wait_return = TRUE; /* may need wait_return in main() */
-	    if (must_redraw < VALID)
-		must_redraw = VALID;
 	    redraw_cmdline = TRUE;
 	    if (cmdline_row > 0 && !exmode_active)
 		--cmdline_row;
@@ -2233,6 +2365,8 @@ inc_msg_scrolled(void)
     }
 #endif
     ++msg_scrolled;
+    if (must_redraw < VALID)
+	must_redraw = VALID;
 }
 
 /*
@@ -2255,7 +2389,15 @@ static msgchunk_T *last_msgchunk = NULL; /* last displayed text */
 static msgchunk_T *msg_sb_start(msgchunk_T *mps);
 static msgchunk_T *disp_sb_line(int row, msgchunk_T *smp);
 
-static int do_clear_sb_text = FALSE;	/* clear text on next msg */
+typedef enum {
+    SB_CLEAR_NONE = 0,
+    SB_CLEAR_ALL,
+    SB_CLEAR_CMDLINE_BUSY,
+    SB_CLEAR_CMDLINE_DONE
+} sb_clear_T;
+
+/* When to clear text on next msg. */
+static sb_clear_T do_clear_sb_text = SB_CLEAR_NONE;
 
 /*
  * Store part of a printed message for displaying when scrolling back.
@@ -2270,10 +2412,11 @@ store_sb_text(
 {
     msgchunk_T	*mp;
 
-    if (do_clear_sb_text)
+    if (do_clear_sb_text == SB_CLEAR_ALL
+	    || do_clear_sb_text == SB_CLEAR_CMDLINE_DONE)
     {
-	clear_sb_text();
-	do_clear_sb_text = FALSE;
+	clear_sb_text(do_clear_sb_text == SB_CLEAR_ALL);
+	do_clear_sb_text = SB_CLEAR_NONE;
     }
 
     if (s > *sb_str)
@@ -2313,23 +2456,53 @@ store_sb_text(
     void
 may_clear_sb_text(void)
 {
-    do_clear_sb_text = TRUE;
+    do_clear_sb_text = SB_CLEAR_ALL;
+}
+
+/*
+ * Starting to edit the command line, do not clear messages now.
+ */
+    void
+sb_text_start_cmdline(void)
+{
+    do_clear_sb_text = SB_CLEAR_CMDLINE_BUSY;
+    msg_sb_eol();
+}
+
+/*
+ * Ending to edit the command line.  Clear old lines but the last one later.
+ */
+    void
+sb_text_end_cmdline(void)
+{
+    do_clear_sb_text = SB_CLEAR_CMDLINE_DONE;
 }
 
 /*
  * Clear any text remembered for scrolling back.
+ * When "all" is FALSE keep the last line.
  * Called when redrawing the screen.
  */
     void
-clear_sb_text(void)
+clear_sb_text(int all)
 {
     msgchunk_T	*mp;
+    msgchunk_T	**lastp;
 
-    while (last_msgchunk != NULL)
+    if (all)
+	lastp = &last_msgchunk;
+    else
     {
-	mp = last_msgchunk->sb_prev;
-	vim_free(last_msgchunk);
-	last_msgchunk = mp;
+	if (last_msgchunk == NULL)
+	    return;
+	lastp = &last_msgchunk->sb_prev;
+    }
+
+    while (*lastp != NULL)
+    {
+	mp = (*lastp)->sb_prev;
+	vim_free(*lastp);
+	*lastp = mp;
     }
 }
 
@@ -2933,7 +3106,7 @@ msg_moremsg(int full)
     int		attr;
     char_u	*s = (char_u *)_("-- More --");
 
-    attr = hl_attr(HLF_M);
+    attr = HL_ATTR(HLF_M);
     screen_puts(s, (int)Rows - 1, 0, attr);
     if (full)
 	screen_puts((char_u *)
@@ -3286,7 +3459,7 @@ give_warning(char_u *message, int hl)
     vim_free(keep_msg);
     keep_msg = NULL;
     if (hl)
-	keep_msg_attr = hl_attr(HLF_W);
+	keep_msg_attr = HL_ATTR(HLF_W);
     else
 	keep_msg_attr = 0;
     if (msg_attr(message, keep_msg_attr) && msg_scrolled == 0)
@@ -3612,7 +3785,7 @@ msg_show_console_dialog(
 	    }
 
 	    /* advance to the next character */
-	    mb_ptr_adv(r);
+	    MB_PTR_ADV(r);
 	}
 
 	if (copy)
@@ -3678,7 +3851,7 @@ display_confirm_msg(void)
     /* avoid that 'q' at the more prompt truncates the message here */
     ++confirm_msg_used;
     if (confirm_msg != NULL)
-	msg_puts_attr(confirm_msg, hl_attr(HLF_M));
+	msg_puts_attr(confirm_msg, HL_ATTR(HLF_M));
     --confirm_msg_used;
 }
 

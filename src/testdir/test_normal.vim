@@ -1,5 +1,6 @@
 " Test for various Normal mode commands
 
+set belloff=all
 func! Setup_NewWindow()
   10new
   call setline(1, range(1,100))
@@ -35,8 +36,20 @@ func! CountSpaces(type, ...)
   let @@ = reg_save
 endfunc
 
-func! IsWindows()
-  return has("win32") || has("win64") || has("win95")
+func! OpfuncDummy(type, ...)
+  " for testing operatorfunc
+  let g:opt=&linebreak
+
+  if a:0  " Invoked from Visual mode, use gv command.
+    silent exe "normal! gvy"
+  elseif a:type == 'line'
+    silent exe "normal! '[V']y"
+  else
+    silent exe "normal! `[v`]y"
+  endif
+  " Create a new dummy window
+  new
+  let g:bufnr=bufnr('%')
 endfunc
 
 fun! Test_normal00_optrans()
@@ -147,7 +160,7 @@ endfunc
 func! Test_normal04_filter()
   " basic filter test
   " only test on non windows platform
-  if IsWindows()
+  if has('win32')
     return
   endif
   call Setup_NewWindow()
@@ -210,23 +223,35 @@ endfunc
 func! Test_normal06_formatprg()
   " basic test for formatprg
   " only test on non windows platform
-  if IsWindows()
+  if has('win32')
     return
-  else
-    " uses sed to number non-empty lines
-    call writefile(['#!/bin/sh', 'sed ''/./=''|sed ''/./{', 'N', 's/\n/    /', '}'''], 'Xsed_format.sh')
-    call system('chmod +x ./Xsed_format.sh')
   endif
-  call Setup_NewWindow()
-  %d
-  call setline(1, ['a', '', 'c', '', ' ', 'd', 'e'])
+
+  " uses sed to number non-empty lines
+  call writefile(['#!/bin/sh', 'sed ''/./=''|sed ''/./{', 'N', 's/\n/    /', '}'''], 'Xsed_format.sh')
+  call system('chmod +x ./Xsed_format.sh')
+  let text = ['a', '', 'c', '', ' ', 'd', 'e']
+  let expected = ['1    a', '', '3    c', '', '5     ', '6    d', '7    e']
+
+  10new
+  call setline(1, text)
   set formatprg=./Xsed_format.sh
   norm! gggqG
-  call assert_equal(['1    a', '', '3    c', '', '5     ', '6    d', '7    e'], getline(1, '$'))
+  call assert_equal(expected, getline(1, '$'))
+  bw!
+
+  10new
+  call setline(1, text)
+  set formatprg=donothing
+  setlocal formatprg=./Xsed_format.sh
+  norm! gggqG
+  call assert_equal(expected, getline(1, '$'))
+  bw!
+
   " clean up
   set formatprg=
+  setlocal formatprg=
   call delete('Xsed_format.sh')
-  bw!
 endfunc
 
 func! Test_normal07_internalfmt()
@@ -239,7 +264,7 @@ func! Test_normal07_internalfmt()
   norm! gggqG
   call assert_equal(['1    2    3', '4    5    6', '7    8    9', '10    11    '], getline(1, '$'))
   " clean up
-  set formatprg= tw=0
+  set tw=0
   bw!
 endfunc
 
@@ -328,7 +353,34 @@ func! Test_normal09_operatorfunc()
   " clean up
   unmap <buffer> ,,
   set opfunc=
+  unlet! g:a
   bw!
+endfunc
+
+func! Test_normal09a_operatorfunc()
+  " Test operatorfunc
+  call Setup_NewWindow()
+  " Add some spaces for counting
+  50,60s/$/  /
+  unlet! g:opt
+  set linebreak
+  nmap <buffer><silent> ,, :set opfunc=OpfuncDummy<CR>g@
+  50
+  norm ,,j
+  exe "bd!" g:bufnr
+  call assert_true(&linebreak)
+  call assert_equal(g:opt, &linebreak)
+  set nolinebreak
+  norm ,,j
+  exe "bd!" g:bufnr
+  call assert_false(&linebreak)
+  call assert_equal(g:opt, &linebreak)
+
+  " clean up
+  unmap <buffer> ,,
+  set opfunc=
+  bw!
+  unlet! g:opt
 endfunc
 
 func! Test_normal10_expand()
@@ -792,7 +844,7 @@ func! Test_normal18_z_fold()
   norm! j
   call assert_equal('52', getline('.'))
 
-  " zA on a opened fold when foldenale is not set
+  " zA on a opened fold when foldenable is not set
   50
   set nofoldenable
   norm! zA
@@ -854,7 +906,7 @@ func! Test_normal18_z_fold()
   norm! j
   call assert_equal('55', getline('.'))
 
-  " 2) do not close fold under curser
+  " 2) do not close fold under cursor
   51
   set nofoldenable
   norm! zx
@@ -1222,7 +1274,7 @@ endfunc
 func! Test_normal23_K()
   " Test for K command
   new
-  call append(0, ['version8.txt', 'man'])
+  call append(0, ['version8.txt', 'man', 'aa%bb', 'cc|dd'])
   let k = &keywordprg
   set keywordprg=:help
   1
@@ -1236,6 +1288,26 @@ func! Test_normal23_K()
   call assert_equal('help', &ft)
   call assert_match('\*version8\.0\*', getline('.'))
   helpclose
+
+  set keywordprg=:new
+  set iskeyword+=%
+  set iskeyword+=\|
+  2
+  norm! K
+  call assert_equal('man', fnamemodify(bufname('%'), ':t'))
+  bwipe!
+  3
+  norm! K
+  call assert_equal('aa%bb', fnamemodify(bufname('%'), ':t'))
+  bwipe!
+  if !has('win32')
+    4
+    norm! K
+    call assert_equal('cc|dd', fnamemodify(bufname('%'), ':t'))
+    bwipe!
+  endif
+  set iskeyword-=%
+  set iskeyword-=\|
 
   " Only expect "man" to work on Unix
   if !has("unix")
@@ -1531,6 +1603,40 @@ fun! Test_normal30_changecase()
   norm! V~
   call assert_equal('THIS IS A simple test: äüöss', getline('.'))
 
+  " Turkish ASCII turns to multi-byte.  On Mac the Turkish locale is available
+  " but toupper()/tolower() don't do the right thing.
+  if !has('mac') && !has('osx')
+    try
+      lang tr_TR.UTF-8
+      set casemap=
+      call setline(1, 'iI')
+      1normal gUU
+      call assert_equal("\u0130I", getline(1))
+      call assert_equal("\u0130I", toupper("iI"))
+
+      call setline(1, 'iI')
+      1normal guu
+      call assert_equal("i\u0131", getline(1))
+      call assert_equal("i\u0131", tolower("iI"))
+
+      set casemap&
+      call setline(1, 'iI')
+      1normal gUU
+      call assert_equal("II", getline(1))
+      call assert_equal("II", toupper("iI"))
+
+      call setline(1, 'iI')
+      1normal guu
+      call assert_equal("ii", getline(1))
+      call assert_equal("ii", tolower("iI"))
+
+      lang en_US.UTF-8
+    catch /E197:/
+      " can't use Turkish locale
+      throw 'Skipped: Turkish locale not available'
+    endtry
+  endif
+
   " clean up
   bw!
 endfunc
@@ -1700,15 +1806,57 @@ fun! Test_normal34_g_cmd3()
   if !has("multi_byte")
     return
   endif
+
   " Test for g8
   new
-  call append(0, 'abcdefghijklmnopqrstuvwxyzäüö')
-  let a=execute(':norm! 1gg$g8')
-  call assert_equal('c3 b6 ', a[1:])
+  let a=execute(':norm! 1G0g8')
+  call assert_equal("\nNUL", a)
 
-  " Test for gp gP
-  call append(1, range(1,10))
+  call setline(1, 'abcdefghijklmnopqrstuvwxyzäüö')
+  let a=execute(':norm! 1G$g8')
+  call assert_equal("\nc3 b6 ", a)
+
+  call setline(1, "a\u0302")
+  let a=execute(':norm! 1G0g8')
+  call assert_equal("\n61 + cc 82 ", a)
+
   " clean up
+  bw!
+endfunc
+
+func Test_normal_8g8()
+  if !has("multi_byte")
+    return
+  endif
+  new
+
+  " Test 8g8 which finds invalid utf8 at or after the cursor.
+
+  " With invalid byte.
+  call setline(1, "___\xff___")
+  norm! 1G08g8g
+  call assert_equal([0, 1, 4, 0, 1], getcurpos())
+
+  " With invalid byte before the cursor.
+  call setline(1, "___\xff___")
+  norm! 1G$h8g8g
+  call assert_equal([0, 1, 6, 0, 9], getcurpos())
+
+  " With truncated sequence.
+  call setline(1, "___\xE2\x82___")
+  norm! 1G08g8g
+  call assert_equal([0, 1, 4, 0, 1], getcurpos())
+
+  " With overlong sequence.
+  call setline(1, "___\xF0\x82\x82\xAC___")
+  norm! 1G08g8g
+  call assert_equal([0, 1, 4, 0, 1], getcurpos())
+
+  " With valid utf8.
+  call setline(1, "café")
+  norm! 1G08g8
+  call assert_equal([0, 1, 1, 0, 1], getcurpos())
+
   bw!
 endfunc
 
@@ -2122,6 +2270,8 @@ func! Test_normal51_FileChangedRO()
   if !has("autocmd")
     return
   endif
+  " Don't sleep after the warning message.
+  call test_settime(1)
   call writefile(['foo'], 'Xreadonly.log')
   new Xreadonly.log
   setl ro
@@ -2131,6 +2281,7 @@ func! Test_normal51_FileChangedRO()
   call assert_equal('Xreadonly.log', bufname(''))
 
   " cleanup
+  call test_settime(0)
   bw!
   call delete("Xreadonly.log")
 endfunc
@@ -2184,26 +2335,46 @@ func! Test_normal53_digraph()
   bw!
 endfunc
 
-func! Test_normal54_Ctrl_bsl()
-	new
-	call setline(1, 'abcdefghijklmn')
-	exe "norm! df\<c-\>\<c-n>"
-	call assert_equal(['abcdefghijklmn'], getline(1,'$'))
-	exe "norm! df\<c-\>\<c-g>"
-	call assert_equal(['abcdefghijklmn'], getline(1,'$'))
-	exe "norm! df\<c-\>m"
-	call assert_equal(['abcdefghijklmn'], getline(1,'$'))
+func Test_normal54_Ctrl_bsl()
+  new
+  call setline(1, 'abcdefghijklmn')
+  exe "norm! df\<c-\>\<c-n>"
+  call assert_equal(['abcdefghijklmn'], getline(1,'$'))
+  exe "norm! df\<c-\>\<c-g>"
+  call assert_equal(['abcdefghijklmn'], getline(1,'$'))
+  exe "norm! df\<c-\>m"
+  call assert_equal(['abcdefghijklmn'], getline(1,'$'))
   if !has("multi_byte")
     return
   endif
-	call setline(2, 'abcdefghijklmnāf')
-	norm! 2gg0
-	exe "norm! df\<Char-0x101>"
-	call assert_equal(['abcdefghijklmn', 'f'], getline(1,'$'))
-	norm! 1gg0
-	exe "norm! df\<esc>"
-	call assert_equal(['abcdefghijklmn', 'f'], getline(1,'$'))
+  call setline(2, 'abcdefghijklmnāf')
+  norm! 2gg0
+  exe "norm! df\<Char-0x101>"
+  call assert_equal(['abcdefghijklmn', 'f'], getline(1,'$'))
+  norm! 1gg0
+  exe "norm! df\<esc>"
+  call assert_equal(['abcdefghijklmn', 'f'], getline(1,'$'))
 
-	" clean up
-	bw!
+  " clean up
+  bw!
+endfunc
+
+func Test_normal_large_count()
+  " This may fail with 32bit long, how do we detect that?
+  new
+  normal o
+  normal 6666666666dL
+  bwipe!
+endfunc
+
+func Test_delete_until_paragraph()
+  if !has('multi_byte')
+    return
+  endif
+  new
+  normal grádv}
+  call assert_equal('á', getline(1))
+  normal grád}
+  call assert_equal('', getline(1))
+  bwipe!
 endfunc
