@@ -61,10 +61,6 @@
 #		of Ruby will cause a compile error on these systems.
 #   RUBY_VER_LONG  same, but in format with dot. (1.6)
 #   DYNAMIC_RUBY no or yes: use yes to load the Ruby DLL dynamically (no)
-# MBYTE		no or yes: set to yes for multi-byte support (yes)
-#		NOTE: multi-byte support is broken in the Borland libraries,
-#		not everything will work properly!  Esp. handling multi-byte
-#		file names.
 # IME		no or yes: set to yes for multi-byte IME support (yes)
 #   DYNAMIC_IME no or yes: set to yes to load imm32.dll dynamically (yes)
 # GETTEXT	no or yes: set to yes for multi-language support (yes)
@@ -76,7 +72,6 @@
 #		3 for 386, 4 for 486, 5 for pentium, 6 for pentium pro.
 # USEDLL	no or yes: set to yes to use the Runtime library DLL (no)
 #		For USEDLL=yes the cc3250.dll is required to run Vim.
-# VIMDLL	no or yes: create vim32.dll, and stub (g)vim.exe (no)
 # ALIGN		1, 2 or 4: Alignment to use (4 for Win32)
 # FASTCALL	no or yes: set to yes to use register-based function protocol (yes)
 # OPTIMIZE	SPACE, SPEED, or MAXSPEED: type of optimization (MAXSPEED)
@@ -102,11 +97,6 @@ BOR = c:\bc5
 ### GUI: yes for GUI version, no for console version
 !if ("$(GUI)"=="")
 GUI = yes
-!endif
-
-### MBYTE: yes for multibyte support, no to disable it.
-!if ("$(MBYTE)"=="")
-MBYTE = yes
 !endif
 
 ### IME: yes for multibyte support, no to disable it.
@@ -196,9 +186,6 @@ HEADERS = -H -H=vim.csm -Hc
 USEDLL = no
 !endif
 
-### VIMDLL: yes for a DLL version of VIM (NOT RECOMMENDED), no otherwise
-#VIMDLL = yes
-
 ### ALIGN: alignment you desire: (1,2 or 4: s/b 4 for Win32)
 !if ("$(ALIGN)"=="")
 ALIGN = 4
@@ -216,7 +203,6 @@ ALIGN = 4
 	("$(RUBY)"=="") && \
 	("$(ICONV)"!="yes") && \
 	("$(IME)"!="yes") && \
-	("$(MBYTE)"!="yes") && \
 	("$(XPM)"=="")
 FASTCALL = yes
 !endif
@@ -397,9 +383,6 @@ DEFINES=$(DEFINES) -DDEBUG -D_DEBUG
 DEFINES = $(DEFINES) -DFEAT_OLE
 !endif
 #
-!if ("$(MBYTE)"=="yes")
-MBDEFINES = $(MBDEFINES) -DFEAT_MBYTE
-!endif
 !if ("$(IME)"=="yes")
 MBDEFINES = $(MBDEFINES) -DFEAT_MBYTE_IME
 !if ("$(DYNAMIC_IME)" == "yes")
@@ -418,18 +401,13 @@ DEFINES = $(DEFINES) -DFEAT_CSCOPE
 !endif
 
 !if ("$(GUI)"=="yes")
-DEFINES = $(DEFINES) -DFEAT_GUI_W32 -DFEAT_CLIPBOARD
+DEFINES = $(DEFINES) -DFEAT_GUI_MSWIN -DFEAT_CLIPBOARD
 !if ("$(DEBUG)"=="yes")
 TARGET = gvimd.exe
 !else
 TARGET = gvim.exe
 !endif
-!if ("$(VIMDLL)"=="yes")
-EXETYPE=-WD
-DEFINES = $(DEFINES) -DVIMDLL
-!else
 EXETYPE=-W
-!endif
 STARTUPOBJ = c0w32.obj
 LINK2 = -aa
 RESFILE = vim.res
@@ -437,7 +415,6 @@ RESFILE = vim.res
 !undef NETBEANS
 !undef CHANNEL
 !undef XPM
-!undef VIMDLL
 !if ("$(DEBUG)"=="yes")
 TARGET = vimd.exe
 !else
@@ -528,21 +505,18 @@ CCARG = +$(OBJDIR)\bcc.cfg
 
 vimmain = \
 	$(OBJDIR)\os_w32exe.obj
-!if ("$(VIMDLL)"=="yes")
-vimwinmain = \
-	$(OBJDIR)\os_w32dll.obj
-!else
 vimwinmain = \
 	$(OBJDIR)\os_w32exe.obj
-!endif
 
 vimobj =  \
 	$(OBJDIR)\arabic.obj \
+	$(OBJDIR)\autocmd.obj \
 	$(OBJDIR)\blowfish.obj \
 	$(OBJDIR)\buffer.obj \
 	$(OBJDIR)\charset.obj \
 	$(OBJDIR)\crypt.obj \
 	$(OBJDIR)\crypt_zip.obj \
+	$(OBJDIR)\debugger.obj \
 	$(OBJDIR)\dict.obj \
 	$(OBJDIR)\diff.obj \
 	$(OBJDIR)\digraph.obj \
@@ -554,12 +528,14 @@ vimobj =  \
 	$(OBJDIR)\ex_docmd.obj \
 	$(OBJDIR)\ex_eval.obj \
 	$(OBJDIR)\ex_getln.obj \
-	$(OBJDIR)\farsi.obj \
 	$(OBJDIR)\fileio.obj \
+	$(OBJDIR)\findfile.obj \
 	$(OBJDIR)\fold.obj \
 	$(OBJDIR)\getchar.obj \
 	$(OBJDIR)\hardcopy.obj \
 	$(OBJDIR)\hashtab.obj \
+	$(OBJDIR)\indent.obj \
+	$(OBJDIR)\insexpand.obj \
 	$(OBJDIR)\json.obj \
 	$(OBJDIR)\list.obj \
 	$(OBJDIR)\main.obj \
@@ -581,6 +557,7 @@ vimobj =  \
 	$(OBJDIR)\screen.obj \
 	$(OBJDIR)\search.obj \
 	$(OBJDIR)\sha256.obj \
+	$(OBJDIR)\sign.obj \
 	$(OBJDIR)\spell.obj \
 	$(OBJDIR)\spellfile.obj \
 	$(OBJDIR)\syntax.obj \
@@ -588,6 +565,7 @@ vimobj =  \
 	$(OBJDIR)\term.obj \
 	$(OBJDIR)\ui.obj \
 	$(OBJDIR)\undo.obj \
+	$(OBJDIR)\usercmd.obj \
 	$(OBJDIR)\userfunc.obj \
 	$(OBJDIR)\version.obj \
 	$(OBJDIR)\window.obj \
@@ -648,17 +626,6 @@ vimobj = $(vimobj) \
     $(OBJDIR)\xpm_w32.obj
 !endif
 
-!if ("$(VIMDLL)"=="yes")
-vimdllobj = $(vimobj)
-!if ("$(DEBUG)"=="yes")
-DLLTARGET = vim32d.dll
-!else
-DLLTARGET = vim32.dll
-!endif
-!else
-DLLTARGET = joebob
-!endif
-
 !if ("$(GUI)"=="yes")
 vimobj = $(vimobj) \
 	$(vimwinmain) \
@@ -680,14 +647,8 @@ MSG = $(MSG) OLE
 !if ("$(USEDLL)"=="yes")
 MSG = $(MSG) USEDLL
 !endif
-!if ("$(VIMDLL)"=="yes")
-MSG = $(MSG) VIMDLL
-!endif
 !if ("$(FASTCALL)"=="yes")
 MSG = $(MSG) FASTCALL
-!endif
-!if ("$(MBYTE)"=="yes")
-MSG = $(MSG) MBYTE
 !endif
 !if ("$(IME)"=="yes")
 MSG = $(MSG) IME
@@ -760,9 +721,6 @@ MSG = $(MSG) Align=$(ALIGNARG)
 
 !message $(MSG)
 
-!if ("$(VIMDLL)"=="yes")
-TARGETS = $(DLLTARGET)
-!endif
 TARGETS = $(TARGETS) $(TARGET)
 
 # Targets:
@@ -820,6 +778,8 @@ clean:
 !endif
 !ifdef PERL
 	-@del perl.lib
+	-@del if_perl.c
+	-@del auto\if_perl.c
 !endif
 !ifdef PYTHON
 	-@del python.lib
@@ -843,60 +803,12 @@ clean:
 	$(MAKE) /f Make_bc5.mak BOR="$(BOR)" clean
 	cd ..
 
-$(DLLTARGET): $(OBJDIR) $(vimdllobj)
-  $(LINK) @&&|
-	$(LFLAGSDLL) +
-	c0d32.obj +
-	$(vimdllobj)
-	$<,$*
-!if ("$(CODEGUARD)"=="yes")
-	cg32.lib+
-!endif
-# $(OSTYPE)==WIN32 causes os_mswin.c compilation. FEAT_SHORTCUT in it needs OLE
-	ole2w32.lib +
-	import32.lib+
-!ifdef LUA
-	$(LUA_LIB_FLAG)lua.lib+
-!endif
-!ifdef PERL
-	$(PERL_LIB_FLAG)perl.lib+
-!endif
-!ifdef PYTHON
-	$(PYTHON_LIB_FLAG)python.lib+
-!endif
-!ifdef PYTHON3
-	$(PYTHON3_LIB_FLAG)python3.lib+
-!endif
-!ifdef RUBY
-	$(RUBY_LIB_FLAG)ruby.lib+
-!endif
-!ifdef TCL
-	$(TCL_LIB_FLAG)tcl.lib+
-!endif
-!ifdef XPM
-	xpm.lib+
-!endif
-!if ("$(USEDLL)"=="yes")
-	cw32i.lib
-!else
-	cw32.lib
-!endif
-	vim.def
-|
 
-!if ("$(VIMDLL)"=="yes")
-$(TARGET): $(OBJDIR) $(DLLTARGET) $(vimmain) $(OBJDIR)\$(RESFILE)
-!else
 $(TARGET): $(OBJDIR) $(vimobj) $(OBJDIR)\$(RESFILE)
-!endif
   $(LINK) @&&|
 	$(LFLAGS) +
 	$(STARTUPOBJ) +
-!if ("$(VIMDLL)"=="yes")
-	$(vimmain)
-!else
 	$(vimobj)
-!endif
 	$<,$*
 !if ("$(CODEGUARD)"=="yes")
 	cg32.lib+
@@ -948,12 +860,12 @@ $(OBJDIR)\if_ole.obj: if_ole.cpp
 $(OBJDIR)\if_lua.obj: if_lua.c lua.lib
 	$(CC) $(CCARG) $(CC1) $(CC2)$@ -pc if_lua.c
 
-$(OBJDIR)\if_perl.obj: if_perl.c perl.lib
-	$(CC) $(CCARG) $(CC1) $(CC2)$@ -pc if_perl.c
+$(OBJDIR)\if_perl.obj: auto/if_perl.c perl.lib
+	$(CC) $(CCARG) $(CC1) $(CC2)$@ -pc auto/if_perl.c
 
-if_perl.c: if_perl.xs typemap
+auto/if_perl.c: if_perl.xs typemap
 	$(PERL)\bin\perl.exe $(PERL)\lib\ExtUtils\xsubpp -prototypes -typemap \
-	    $(PERL)\lib\ExtUtils\typemap if_perl.xs > $@
+	    $(PERL)\lib\ExtUtils\typemap if_perl.xs -output $@
 
 $(OBJDIR)\if_python.obj: if_python.c if_py_both.h python.lib
 	$(CC) -I$(PYTHON)\include $(CCARG) $(CC1) $(CC2)$@ -pc if_python.c

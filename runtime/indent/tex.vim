@@ -2,7 +2,7 @@
 " Language:     LaTeX
 " Maintainer:   Yichao Zhou <broken.zhou AT gmail.com>
 " Created:      Sat, 16 Feb 2002 16:50:19 +0100
-" Version: 0.9.4
+" Version: 1.0.0
 "   Please email me if you found something I can do.  Comments, bug report and
 "   feature request are welcome.
 
@@ -62,6 +62,8 @@
 "               (*) Fix a bug between g:tex_noindent_env and g:tex_indent_items
 "                   Now g:tex_noindent_env='document\|verbatim\|itemize' (Emacs
 "                   style) is supported.  Thanks Miles Wheeler for reporting.
+"               2018/02/07 by Yichao Zhou <broken.zhou AT gmail.com>
+"               (*) Make indentation more smart in the normal mode
 "
 " }}}
 
@@ -91,19 +93,14 @@
 "   If this variable is set, item-environments are indented like Emacs does
 "   it, i.e., continuation lines are indented with a shiftwidth.
 "
-"   NOTE: I've already set the variable below; delete the corresponding line
-"   if you don't like this behaviour.
-"
-"   Per default, it is unset.
-"
-"              set                                unset
-"   ----------------------------------------------------------------
-"       \begin{itemize}                      \begin{itemize}
-"         \item blablabla                      \item blablabla
-"           bla bla bla                        bla bla bla
-"         \item blablabla                      \item blablabla
-"           bla bla bla                        bla bla bla
-"       \end{itemize}                        \end{itemize}
+"              set                      unset
+"   ------------------------------------------------------
+"       \begin{itemize}            \begin{itemize}
+"         \item blablabla            \item blablabla
+"           bla bla bla              bla bla bla
+"         \item blablabla            \item blablabla
+"           bla bla bla              bla bla bla
+"       \end{itemize}              \end{itemize}
 "
 "
 " * g:tex_items
@@ -215,14 +212,14 @@ function! GetTeXIndent() " {{{
     " ZYC modification : \end after \begin won't cause wrong indent anymore
     if line =~ '\\begin{.*}' 
         if line !~ g:tex_noindent_env
-            let ind = ind + &sw
+            let ind = ind + shiftwidth()
             let stay = 0
         endif
 
         if g:tex_indent_items
             " Add another sw for item-environments
             if line =~ g:tex_itemize_env
-                let ind = ind + &sw
+                let ind = ind + shiftwidth()
                 let stay = 0
             endif
         endif
@@ -241,23 +238,23 @@ function! GetTeXIndent() " {{{
         if g:tex_indent_items
             " Remove another sw for item-environments
             if cline =~ g:tex_itemize_env
-                let ind = ind - &sw
+                let ind = ind - shiftwidth()
                 let stay = 0
             endif
         endif
 
-        let ind = ind - &sw
+        let ind = ind - shiftwidth()
         let stay = 0
     endif
 
     if g:tex_indent_brace
         if line =~ '[[{]$'
-            let ind += &sw
+            let ind += shiftwidth()
             let stay = 0
         endif
 
         if cline =~ '^\s*\\\?[\]}]' && s:CheckPairedIsLastCharacter(v:lnum, indent(v:lnum))
-            let ind -= &sw
+            let ind -= shiftwidth()
             let stay = 0
         endif
 
@@ -266,7 +263,7 @@ function! GetTeXIndent() " {{{
                 let char = line[i]
                 if char == ']' || char == '}'
                     if s:CheckPairedIsLastCharacter(lnum, i)
-                        let ind -= &sw
+                        let ind -= shiftwidth()
                         let stay = 0
                     endif
                 endif
@@ -280,18 +277,19 @@ function! GetTeXIndent() " {{{
     if g:tex_indent_items
         " '\item' or '\bibitem' itself:
         if cline =~ g:tex_items
-            let ind = ind - &sw
+            let ind = ind - shiftwidth()
             let stay = 0
         endif
         " lines following to '\item' are intented once again:
         if line =~ g:tex_items
-            let ind = ind + &sw
+            let ind = ind + shiftwidth()
             let stay = 0
         endif
     endif
 
-    if stay
-        " If there is no obvious indentation hint, we trust our user.
+    if stay && mode() == 'i'
+        " If there is no obvious indentation hint, and indentation is triggered
+        " in insert mode, we trust our user.
         if empty(cline)
             return ind
         else
@@ -317,9 +315,9 @@ function! s:GetLastBeginIndentation(lnum) " {{{
                 return indent(lnum)
             endif
             if line =~ g:tex_itemize_env
-                return indent(lnum) + 2 * &sw
+                return indent(lnum) + 2 * shiftwidth()
             endif
-            return indent(lnum) + &sw
+            return indent(lnum) + shiftwidth()
         endif
     endfor
     return -1
@@ -347,7 +345,7 @@ function! s:GetEndIndentation(lnum) " {{{
             let min_indent = min([min_indent, indent(lnum)])
         endif
     endfor
-    return min_indent - &sw
+    return min_indent - shiftwidth()
 endfunction
 
 " Most of the code is from matchparen.vim
