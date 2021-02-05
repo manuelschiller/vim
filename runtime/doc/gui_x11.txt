@@ -508,6 +508,56 @@ To eliminate borders when maximized: >
     }
 
 
+Using the GTK+ version with fonts with ligatures ~
+
+For a character-based editor like Vim, fonts with ligatures are tricky because
+characters are no longer rendered independently of each other. Instead, their
+rendering depends on the characters surrounding them.
+
+To keep rendering for the vast majority of characters fast, the GTK+ version
+usually skips a process called shaping which choses glyphs for the chacters to
+be displayed depending on the surrounding characters, and instead uses a
+lookup table to get the glyphs for the first 128 characters (0-127), ignoring
+the surrounding characters. Since ligatures are special glyphs for certain
+combinations of two or more characters, that kind of caching disables
+ligatures.
+
+Users can choose if they want the fastest rendering (which is the default), or
+if they prefer to disable the cache for certain characters, enabling ligatures
+to be shown. To this end, there exists a global variable which can be set. It
+is a bit map of the first 128 characters, encoded in four 32-bit integers. A
+set bit disables the glyph cache for the corresponding character, and enables
+glyph shaping (and thus ligatures). For example, to bypass the glyph cache for
+everything but control characters (< 32), 0-9, A-Z, a-z, and ASCII code 127,
+you could use something like: >
+
+    let g:gtk_nocache=[0x00000000, 0xfc00ffff,0xf8000001, 0x78000001]
+
+This is usually a good starting point if you use programming fonts with
+ligatures, but you might want to fine-tune your setting depending on your
+preferences.
+
+Since the rest of Vim is blissfully unaware of the intricacies of glyph
+shaping and ligatures, the screen updating code which repaints part of all of
+the screen does not know enough to repaint ligatures correctly. A partial
+repaint might therefore "break" the ligatures by not including enough context.
+For example, if a font has a ligature for the "<=" combination, the repainting
+code might repaint only the "<", but not the "=" part of the ligature glyph.
+This looks a little garbled, but is not harmful. Pressing Ctrl-L to repaint
+the screen usually fixes these corruptions in the display (except for
+ligatures on the current cursor position).
+
+This can be considered a shortcoming of the current implementation (and
+rightfully so), but it allows the rest of the Vim codebase to remain simple
+and fast, allowing people on less powerful machines to edit away efficiently.
+To the mind of the author of the g:gtk_nocache patch code, it's more important
+to be inclusive, and keep Vim as a tool that runs well in any environment,
+than to have the latest eye-candy. In that spirit, the ligature handling is
+a compromise - currently a fairly minimal one which has a couple of glitches,
+but is still very usable in everyday editing, and preserves most of the
+simplicity and speed of the old code.
+
+
 Using Vim as a GTK+ plugin ~
 							*gui-gtk-socketid*
 When the GTK+ version of Vim starts up normally, it creates its own top level
